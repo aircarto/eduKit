@@ -19,7 +19,7 @@ SensAir_S88::SensAir_S88() : _serial(nullptr), _lastError(0) {
   memset(_response, 0, sizeof(_response));
 }
 
-void SensAir_S88::begin(HardwareSerial &serial) {
+void SensAir_S88::begin(Stream &serial) {
   _serial = &serial;
   _lastError = 0;
 }

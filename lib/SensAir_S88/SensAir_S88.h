@@ -11,7 +11,6 @@
 #define SENSAIR_S88_H
 
 #include <Arduino.h>
-#include <HardwareSerial.h>
 
 class SensAir_S88 {
 public:
@@ -19,9 +18,9 @@ public:
 
   /**
    * Initialise le capteur avec un port série
-   * @param serial Port série hardware (Serial1 ou Serial2 sur ESP32)
+   * @param serial Port série hardware (Serial1 sur Pico)
    */
-  void begin(HardwareSerial &serial);
+  void begin(Stream &serial);
 
   /**
    * Lit la valeur de CO2 en ppm
@@ -37,7 +36,7 @@ public:
   uint8_t getLastError();
 
 private:
-  HardwareSerial *_serial;
+  Stream *_serial;
   uint8_t _lastError;
 
   // Commande Modbus pour lire le CO2
