@@ -17,7 +17,7 @@ Liste des composants avec références LCSC .
 | Résistance | 10 kΩ | 0603 | R7 | C2930027 |
 | Résistance | 73.2 kΩ | 0402 | R8 | C26986 |
 | Chargeur Li‑ion | TP4056 (charge 1 cellule) | ESOP-8L | U2 | C49045948 |
-| MOSFET double | FS8205A (double MOSFET pour protection) | SOT‑23‑6 | Q3 | C32254 |
+| MOSFET double | FS8205A (double MOSFET pour protection) | SOT‑23‑6 | Q3 | C2830320 |
 | Protection Li‑ion | DW01A (IC protection 1 cellule) | SOT‑23‑6 | U3 | C351410 |
 | Diode Schottky | SS34 (redressement / protection) | SMA | D1, D2 | C22448055 |
 | Résistance | 100 Ω | 0603 | R5 | C2906981 |
