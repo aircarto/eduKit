@@ -1,56 +1,59 @@
-# Kit Pedagogique CO2
+# Kit Pedagogique CO2 (EduKit)
 
-Projet simple pour mesurer et afficher le CO2 en temps réel avec un ESP32.
+Mesure et affiche le CO2 en temps réel avec un Raspberry Pi Pico 2 W, et envoie
+les mesures au serveur AirCarto pour les consulter dans l'app.
 
 ## Materiel Necessaire
 
 | Composant | Quantité |
 |-----------|----------|
-| ESP32 DevKit V1 | 1 |
+| Raspberry Pi Pico 2 W | 1 |
 | Capteur CO2 SensAir S88 | 1 |
-| Ecran OLED 0.96" SSD1306 I2C | 1 |
+| Ecran OLED 0.96" SSD1306 I2C (bicolore jaune/bleu) | 1 |
 | Cables dupont | ~8 |
-| Breadboard (optionnel) | 1 |
 
-## Schema de Cablage
+## Cablage
 
-```
-                    ESP32 DevKit
-                  ┌──────────────┐
-                  │              │
-    OLED GND ─────┤ GND      VIN ├───── SensAir G+ (5V)
-    OLED VDD ─────┤ 3V3      GND ├───── SensAir G0
-                  │              │
-    OLED SCK ─────┤ GPIO22       │
-    OLED SDA ─────┤ GPIO21       │
-                  │              │
-SensAir TxD ──────┤ GPIO16 (RX2) │
-SensAir RxD ──────┤ GPIO17 (TX2) │
-                  │              │
-                  └──────────────┘
-```
+#### Ecran OLED SSD1306 (I2C, adresse 0x3C)
+| OLED | Pico 2 W | Broche physique |
+|------|----------|-----------------|
+| GND  | GND | 38 |
+| VDD  | 3V3 (OUT) | 36 |
+| SCK (= SCL) | GPIO 5 (I2C0 SCL) | 7 |
+| SDA  | GPIO 4 (I2C0 SDA) | 6 |
 
-### Details du Cablage
+#### Capteur SensAir S88 (UART, Modbus RTU 9600 bauds)
+| SensAir | Pico 2 W | Broche physique |
+|---------|----------|-----------------|
+| G0       | GND | 38 |
+| G+       | VBUS (5V) | 40 |
+| UART_TxD | GPIO 1 (UART0 RX) | 2 |
+| UART_RxD | GPIO 0 (UART0 TX) | 1 |
 
-#### Ecran OLED SSD1306 (I2C)
-| OLED | ESP32 |
-|------|-------|
-| GND  | GND   |
-| VDD  | 3.3V  |
-| SCK  | GPIO 22 (horloge I2C) |
-| SDA  | GPIO 21 |
+> ⚠️ Le SensAir S88 s'alimente en **5V**. `VBUS` n'a du 5V que lorsque le Pico
+> est branché en USB : sur batterie, il faut alimenter `G+` par la sortie 5V
+> de l'alimentation. Ses lignes UART sont en 3.3V, compatibles avec le Pico.
 
-#### Capteur SensAir S88 (UART)
-| SensAir | ESP32 |
-|---------|-------|
-| G0      | GND   |
-| G+      | 5V (VIN) |
-| UART_TxD | GPIO 16 (RX2) |
-| UART_RxD | GPIO 17 (TX2) |
+## Configuration WiFi depuis l'app AirCarto
 
-> ⚠️ **ATTENTION**: Le capteur SensAir S88 fonctionne en **5V**, pas en 3.3V!
-> Utilise la pin `VIN` de l'ESP32 (qui sort du 5V quand branché en USB).
-> Les autres pins (Alarm_OC, PWM 1kHz, DVCC_out, etc.) ne sont pas utilisées.
+L'EduKit parle le même protocole Bluetooth (**Improv WiFi**) que le ModuleAir,
+le ModuleAir mini et l'Alba :
+
+1. **Hors ligne** (premier démarrage, réseau introuvable), l'EduKit continue
+   d'afficher le CO2 avec l'icône réseau barrée, et s'annonce en Bluetooth
+   sous le nom `EduKit-<deviceId>`.
+2. Dans l'app, il apparaît dans la liste des capteurs à proximité : on choisit
+   le réseau, on tape le mot de passe. L'écran affiche « App connectee », puis
+   « Connexion WiFi », puis le verdict.
+3. **En ligne**, le Bluetooth s'arrête et la moyenne du CO2 est envoyée toutes
+   les 60 s à `data.moduleair.fr/eduKit/edukit_endpoint.php`.
+
+Si le réseau tombe, l'EduKit le cherche pendant 3 min, puis repasse en annonce
+Bluetooth et retente le réseau enregistré toutes les 10 min.
+
+Le `deviceId` est l'identifiant unique du Pico (16 caractères hexa), celui
+qu'utilise le serveur. Un EduKit déjà configuré avec un firmware 1.x garde son
+réseau après la mise à jour.
 
 ## Commandes
 
@@ -65,39 +68,41 @@ pio run -t upload
 pio device monitor
 ```
 
-## Fonctionnement
+Sur le moniteur série (115200 bauds) :
 
-1. **Au démarrage**: L'écran affiche "ATELIER PEDAGOGIQUE" avec une barre de progression
-2. **Ensuite**: La valeur de CO2 s'affiche en gros avec un message selon le niveau:
-   - **< 800 ppm**: "Air excellent" (bien aéré)
-   - **800-1200 ppm**: "Correct" (acceptable)
-   - **1200-1500 ppm**: "Aérer SVP!" (à surveiller)
-   - **> 1500 ppm**: "AÉRER VITE!" (urgent)
+| Touche | Action |
+|--------|--------|
+| `i` | Affiche l'identité (version, deviceId, nom Bluetooth, réseau) |
+| `r` | Oublie le réseau WiFi enregistré et repasse en annonce Bluetooth |
+
+## Affichage
+
+- **< 800 ppm** : « BIEN »
+- **≥ 800 ppm** : « AERER SVP »
+- En haut à droite : barres de signal WiFi, ou icône barrée hors ligne.
+- « Branchements incorrects » : aucune mesure valide du capteur depuis 10 s.
 
 ## Structure du Projet
 
 ```
 kit-pedagogique-co2/
-├── platformio.ini          # Configuration PlatformIO
+├── platformio.ini          # Configuration PlatformIO (plateforme et coeur épinglés)
+├── include/
+│   └── pico_compat.h       # Preferences (ESP32) émulé sur LittleFS
 ├── src/
-│   └── main.cpp            # Code principal
+│   ├── main.cpp            # Capteur, écran, machine à états réseau, envoi
+│   ├── ble_improv.h        # Configuration WiFi par Bluetooth (Improv)
+│   └── ble_improv.cpp
 ├── lib/
 │   └── SensAir_S88/        # Bibliothèque capteur CO2
-│       ├── SensAir_S88.h
-│       └── SensAir_S88.cpp
-└── README.md               # Ce fichier
+└── server/                 # Endpoints PHP (réception, historique, nom public)
 ```
 
-## Debug
-
-Les logs série sont disponibles à 115200 bauds. Tu verras:
-- Les valeurs CO2 toutes les 2 secondes
-- Les erreurs de communication si le capteur n'est pas détecté
-
-### Erreurs Communes
+## Erreurs Communes
 
 | Erreur | Cause probable |
 |--------|----------------|
-| "Timeout" | Capteur non connecté ou mauvais câblage TX/RX |
+| "Timeout" | Capteur non connecté ou TX/RX inversés |
 | "Réponse invalide" | Interférence ou capteur défectueux |
 | Valeurs aberrantes | Capteur en préchauffage (attendre 1-2 min) |
+| EduKit absent de l'app | Il est en ligne (Bluetooth coupé) : `r` sur le port série pour le reconfigurer |

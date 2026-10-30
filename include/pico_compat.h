@@ -69,8 +69,11 @@ public:
     return putString(key, String(value));
   }
 
-  void clear() {
-    if (_readOnly) return;
+  bool remove(const char* key) {
+    if (_readOnly) return false;
+    String path = makePath(key);
+    if (!LittleFS.exists(path)) return true;
+    return LittleFS.remove(path);
   }
 };
 

@@ -1,6 +1,6 @@
 /**
  * ============================================
- *         KIT PEDAGOGIQUE CO2
+ *         KIT PEDAGOGIQUE CO2 (EduKit)
  * ============================================
  *
  * Materiel:
@@ -10,10 +10,10 @@
  *
  * Cablage:
  *   OLED:
- *     - GND  -> GND
- *     - VDD  -> 3.3V
- *     - SCL  -> GPIO 5 (I2C0 SCL)
- *     - SDA  -> GPIO 4 (I2C0 SDA)
+ *     - GND        -> GND
+ *     - VDD        -> 3.3V (3V3 OUT)
+ *     - SCK (SCL)  -> GPIO 5 (I2C0 SCL)
+ *     - SDA        -> GPIO 4 (I2C0 SDA)
  *
  *   SensAir S88:
  *     - G0       -> GND
@@ -25,17 +25,31 @@
  *
  * OLED bicolore: les 16 premiers pixels (y 0-15) sont jaunes,
  * le reste (y 16-63) est bleu. Le layout est optimise en consequence.
+ *
+ * Reseau (meme mecanique que l'Alba et le ModuleAir mini):
+ *   - En ligne : envoi des mesures, Bluetooth coupe.
+ *   - Hors ligne : le CO2 reste affiche (icone reseau barree) et l'EduKit
+ *     s'annonce en Bluetooth "EduKit-<deviceId>" (protocole Improv WiFi) :
+ *     l'app AirCarto le detecte et lui envoie un reseau. Le reseau enregistre
+ *     est retente en arriere-plan toutes les 10 minutes.
+ *
+ * Commandes serie (115200 bauds):
+ *   r : oublier le reseau WiFi enregistre (repasse en annonce Bluetooth)
+ *   i : afficher l'identite du capteur
  */
 
 #include "SensAir_S88.h"
-#include "ble_provisioning.h"
+#include "ble_improv.h"
 #include "pico_compat.h"
 #include <Arduino.h>
 #include <HTTPClient.h>
 #include <SSD1306Wire.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <Wire.h>
 #include <pico/unique_id.h>
+
+#define FIRMWARE_VERSION "2.0.0"
 
 // ============================================
 // CONFIGURATION SERVEUR
@@ -44,18 +58,12 @@
 const char *ENDPOINT_URL =
     "https://data.moduleair.fr/eduKit/edukit_endpoint.php";
 
-const char *GET_PUBLIC_NAME_URL =
-    "https://api.aircarto.fr/capteurs/getPublicName.php";
-
-// Identifiant unique du capteur
+// Identifiant unique du capteur (ID du Pico, cle cote serveur)
 String deviceId = "";
 
-// Nom public du capteur (recupere depuis le serveur)
-String publicName = "";
-
-// Configuration WiFi (chargee depuis NVS)
-String wifiSSID = "airlabo";
-String wifiPassword = "xxxxxx";
+// Nom Bluetooth annonce : "EduKit-<deviceId>". L'app lit le produit dans le
+// prefixe et le deviceId dans les hexa de fin (services/improv-names.ts).
+String bleName = "";
 
 // ============================================
 // CONFIGURATION DES PINS
@@ -73,18 +81,49 @@ String wifiPassword = "xxxxxx";
 // ============================================
 
 #define CO2_READ_INTERVAL 2000
+#define DISPLAY_INTERVAL 500
+// Sans mesure valide depuis ce delai, on cesse d'afficher la derniere valeur
+// (capteur debranche en cours de route).
+#define CO2_STALE_MS 10000
 
 // Seuils de CO2
 #define CO2_GOOD 800
 #define CO2_BAD 1500
 
+// Rythmes reseau (ceux de l'Alba / ModuleAir_V4)
+#define WIFI_BOOT_TIMEOUT_MS 20000UL              // essai au demarrage
+#define STA_RECONNECT_WINDOW_MS (3UL * 60 * 1000) // lien perdu : 3 min d'essais
+#define STA_RECONNECT_KICK_MS 30000UL             // relance du driver
+#define OFFLINE_RETRY_INTERVAL_MS (10UL * 60 * 1000)
+#define OFFLINE_RETRY_TIMEOUT_MS 30000UL
+#define PROVISION_TIMEOUT_MS 40000UL // filet : ble_improv tranche en 20 s
+#define FIRST_SEND_DELAY_MS 15000UL  // 1er envoi peu apres la connexion
+
 // ============================================
-// MACHINE A ETATS
+// MACHINE A ETATS RESEAU
 // ============================================
 
-enum AppState { STATE_BLE_PROVISIONING, STATE_NORMAL };
+enum NetState {
+  NET_ONLINE,       // connecte au reseau enregistre, envoi des mesures
+  NET_RECONNECTING, // lien perdu : on tente de le retrouver pendant 3 min
+  NET_OFFLINE,      // annonce Bluetooth, nouvel essai toutes les 10 min
+  NET_RETRYING,     // hors ligne, essai en arriere-plan du reseau enregistre
+  NET_PROVISIONING, // l'app a envoye un reseau, ble_improv attend le verdict
+};
 
-AppState currentState = STATE_BLE_PROVISIONING;
+NetState netState = NET_OFFLINE;
+unsigned long netStateSince = 0;
+unsigned long lastReconnectKick = 0;
+
+// Reseau enregistre
+String storedSSID = "";
+String storedPassword = "";
+
+// Reseau envoye par l'app, mis de cote tant qu'il n'a pas FAIT SES PREUVES :
+// seule une connexion reussie l'enregistre, une faute de frappe n'ecrase donc
+// jamais le reseau qui marchait.
+String pendingSSID = "";
+String pendingPassword = "";
 
 // ============================================
 // OBJETS GLOBAUX
@@ -95,13 +134,14 @@ SensAir_S88 co2Sensor;
 
 // Variables
 int currentCO2 = 0;
+unsigned long lastCO2Ok = 0; // millis() de la derniere mesure valide (0 = jamais)
 unsigned long lastCO2Read = 0;
-unsigned long lastDataSend = 0;
 unsigned long lastDisplayUpdate = 0;
+unsigned long nextDataSendAt = 0;
+unsigned long screenHoldUntil = 0; // ecran transitoire (verdict WiFi) a garder
 uint32_t co2Sum = 0;
 uint16_t co2SampleCount = 0;
-bool sensorReady = false;
-bool wifiConnected = false;
+int refreshRateSeconds = 60;
 
 // ============================================
 // ECRAN DE CHARGEMENT
@@ -154,196 +194,73 @@ void generateDeviceId() {
   Serial.printf("Device ID (Pico ID): %s\n", deviceId.c_str());
 }
 
-// ============================================
-// CONNEXION WIFI
-// ============================================
-
-void displayWiFiConnecting(const String &ssid) {
-  display.clear();
-
-  // Zone jaune (0-15): titre
-  display.setFont(ArialMT_Plain_10);
-  display.setTextAlignment(TEXT_ALIGN_CENTER);
-  display.drawString(64, 2, "Connexion WiFi");
-
-  // Zone bleue (16-63): SSID
-  display.setFont(ArialMT_Plain_16);
-  display.drawString(64, 24, ssid);
-  display.setFont(ArialMT_Plain_10);
-  display.drawString(64, 48, "Veuillez patienter...");
-  display.display();
-}
-
-void displayWiFiStatus(bool connected) {
-  display.clear();
-
-  // Zone jaune (0-15): titre
-  display.setFont(ArialMT_Plain_10);
-  display.setTextAlignment(TEXT_ALIGN_CENTER);
-  display.drawString(64, 2, "WiFi");
-
-  // Zone bleue (16-63): statut
-  display.setFont(ArialMT_Plain_16);
-  display.setTextAlignment(TEXT_ALIGN_CENTER);
-  if (connected) {
-    display.drawString(64, 22, "Connexion");
-    display.drawString(64, 40, "etablie");
-  } else {
-    display.drawString(64, 22, "Connexion");
-    display.drawString(64, 40, "echouee");
-  }
-  display.display();
-  delay(connected ? 800 : 2000);
-}
-
-bool connectWiFi() {
-  Serial.printf("Connexion au WiFi: %s\n", wifiSSID.c_str());
-  displayWiFiConnecting(wifiSSID);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
-
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 120) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-  Serial.println();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("WiFi connecte! IP: %s\n", WiFi.localIP().toString().c_str());
-    Serial.printf("Signal WiFi: %d dBm\n", WiFi.RSSI());
-    wifiConnected = true;
-    displayWiFiStatus(true);
-    return true;
-  } else {
-    Serial.println("Echec connexion WiFi!");
-    wifiConnected = false;
-    displayWiFiStatus(false);
-    return false;
-  }
+void printIdentity() {
+  Serial.println("================================");
+  Serial.printf("  Firmware   : EduKit %s\n", FIRMWARE_VERSION);
+  Serial.printf("  Device ID  : %s\n", deviceId.c_str());
+  Serial.printf("  Bluetooth  : %s\n", bleName.c_str());
+  Serial.printf("  Reseau     : %s\n",
+                storedSSID.length() ? storedSSID.c_str() : "(aucun)");
+  Serial.printf("  Envoi      : toutes les %d s\n", refreshRateSeconds);
+  Serial.println("================================");
 }
 
 // ============================================
-// RECUPERATION DU NOM PUBLIC
+// STOCKAGE PERSISTANT
 // ============================================
+// Memes cles que le firmware 1.x : un EduKit deja configure reste en ligne
+// apres la mise a jour.
 
-bool fetchPublicName() {
-  if (!wifiConnected || WiFi.status() != WL_CONNECTED) {
-    Serial.println("[API] WiFi non connecte");
-    return false;
-  }
-
-  HTTPClient http;
-  WiFiClientSecure client;
-  client.setInsecure();
-
-  String url = String(GET_PUBLIC_NAME_URL) + "?device_id=" + deviceId;
-
-  Serial.println("[API] Recuperation du nom public...");
-  Serial.println("[API] URL: " + url);
-
-  http.begin(client, url);
-  http.addHeader("Content-Type", "application/json");
-
-  int httpCode = http.GET();
-
-  if (httpCode == 200) {
-    String response = http.getString();
-    Serial.println("[API] Reponse: " + response);
-
-    int startIdx = response.indexOf("\"public_name\":");
-    if (startIdx != -1) {
-      startIdx += 14;
-      while (startIdx < (int)response.length() &&
-             (response[startIdx] == ' ' || response[startIdx] == '"')) {
-        startIdx++;
-      }
-      int endIdx = response.indexOf("\"", startIdx);
-      if (endIdx != -1) {
-        publicName = response.substring(startIdx, endIdx);
-        Serial.println("[API] Nom public recupere: " + publicName);
-
-        Preferences prefs;
-        prefs.begin("edukit", false);
-        prefs.putString("public_name", publicName);
-        prefs.end();
-
-        http.end();
-        return true;
-      }
-    }
-    Serial.println("[API] ERREUR: Impossible de parser le nom public");
-  } else {
-    Serial.printf("[API] ERREUR: Code HTTP %d\n", httpCode);
-  }
-
-  http.end();
-  return false;
+bool loadWiFiConfig() {
+  Preferences prefs;
+  prefs.begin("wifi", true);
+  storedSSID = prefs.getString("ssid", "");
+  storedPassword = prefs.getString("password", "");
+  prefs.end();
+  return storedSSID.length() > 0;
 }
 
-void loadPublicNameFromNVS() {
+void saveWiFiConfig(const String &ssid, const String &password) {
+  Preferences prefs;
+  prefs.begin("wifi", false);
+  prefs.putString("ssid", ssid);
+  prefs.putString("password", password);
+  prefs.end();
+  storedSSID = ssid;
+  storedPassword = password;
+  Serial.printf("[NVS] Reseau enregistre: %s\n", ssid.c_str());
+}
+
+void forgetWiFiConfig() {
+  Preferences prefs;
+  prefs.begin("wifi", false);
+  prefs.remove("ssid");
+  prefs.remove("password");
+  prefs.end();
+  storedSSID = "";
+  storedPassword = "";
+  Serial.println("[NVS] Reseau oublie");
+}
+
+// Cadence d'envoi reglee par l'ancienne app (10, 30 ou 60 s), conservee si
+// elle existe. 60 s sinon.
+void loadRefreshRate() {
   Preferences prefs;
   prefs.begin("edukit", true);
-  publicName = prefs.getString("public_name", "");
+  int rate = prefs.getInt("refresh_rate", 60);
   prefs.end();
 
-  if (publicName.length() > 0) {
-    Serial.println("[NVS] Nom public charge: " + publicName);
-  } else {
-    Serial.println("[NVS] Pas de nom public stocke");
+  if (rate != 10 && rate != 30 && rate != 60) {
+    rate = 60;
   }
+  refreshRateSeconds = rate;
 }
 
 // ============================================
 // ENVOI DES DONNEES AU SERVEUR
 // ============================================
 
-String lastHttpError = "";
-
-String getHttpErrorMessage(int code) {
-  switch (code) {
-  case 200:
-    return "OK";
-  case 400:
-    return "Capteur inconnu";
-  case 401:
-    return "JSON invalide";
-  case 500:
-    return "Erreur serveur";
-  case -1:
-    return "Connexion echouee";
-  case -2:
-    return "Envoi echoue";
-  case -3:
-    return "Timeout";
-  case -4:
-    return "Pas de reponse";
-  case -5:
-    return "Connexion perdue";
-  case -6:
-    return "WiFi deconnecte";
-  default:
-    if (code < 0)
-      return "Erreur reseau";
-    if (code >= 500)
-      return "Erreur serveur";
-    if (code >= 400)
-      return "Erreur requete";
-    return "Erreur inconnue";
-  }
-}
-
 int sendDataToServer(int co2Value) {
-  if (!wifiConnected || WiFi.status() != WL_CONNECTED) {
-    Serial.println("[HTTP] WiFi non connecte, tentative de reconnexion...");
-    if (!connectWiFi()) {
-      Serial.println("[HTTP] ERREUR: Impossible de se reconnecter au WiFi");
-      return -6;
-    }
-  }
-
   HTTPClient http;
   WiFiClientSecure client;
   client.setInsecure();
@@ -391,8 +308,13 @@ int sendDataToServer(int co2Value) {
 }
 
 // ============================================
-// AFFICHAGE DU CO2
+// AFFICHAGE
 // ============================================
+
+bool isOnline() { return netState == NET_ONLINE && WiFi.status() == WL_CONNECTED; }
+
+// Garde l'ecran courant (verdict WiFi) pendant `ms` avant de reprendre le CO2.
+void holdScreen(unsigned long ms) { screenHoldUntil = millis() + ms; }
 
 const char *getCO2Message(int co2) {
   if (co2 > -1 && co2 < CO2_GOOD)
@@ -402,6 +324,38 @@ const char *getCO2Message(int co2) {
   if (co2 >= CO2_BAD)
     return "AERER SVP";
   return "ERREUR";
+}
+
+void displayWiFiConnecting(const String &ssid) {
+  display.clear();
+
+  // Zone jaune (0-15): titre
+  display.setFont(ArialMT_Plain_10);
+  display.setTextAlignment(TEXT_ALIGN_CENTER);
+  display.drawString(64, 2, "Connexion WiFi");
+
+  // Zone bleue (16-63): SSID
+  display.setFont(ArialMT_Plain_16);
+  display.drawString(64, 24, ssid);
+  display.setFont(ArialMT_Plain_10);
+  display.drawString(64, 48, "Veuillez patienter...");
+  display.display();
+}
+
+void displayWiFiResult(bool connected) {
+  display.clear();
+
+  // Zone jaune (0-15): titre
+  display.setFont(ArialMT_Plain_10);
+  display.setTextAlignment(TEXT_ALIGN_CENTER);
+  display.drawString(64, 2, "WiFi");
+
+  // Zone bleue (16-63): statut
+  display.setFont(ArialMT_Plain_16);
+  display.setTextAlignment(TEXT_ALIGN_CENTER);
+  display.drawString(64, 22, "Connexion");
+  display.drawString(64, 40, connected ? "etablie" : "echouee");
+  display.display();
 }
 
 void drawWiFiBarsWithLevel(int level, bool crossed) {
@@ -455,17 +409,20 @@ void drawWiFiBarsDisconnected() { drawWiFiBarsWithLevel(0, true); }
 void displayCO2(int co2) {
   display.clear();
 
-  // Zone jaune (y 0-15): header avec "CO2 (ppm)" et indicateur WiFi
+  // Zone jaune (y 0-15): "CO2", etat de l'app et indicateur WiFi
   display.setFont(ArialMT_Plain_10);
   display.setTextAlignment(TEXT_ALIGN_LEFT);
   display.drawString(0, 2, "CO2");
 
-  // Indicateur WiFi en haut a droite (zone jaune)
-  if (wifiConnected && WiFi.status() == WL_CONNECTED) {
+  if (bleImprovUiState() == BLE_UI_LINKED) {
+    display.setTextAlignment(TEXT_ALIGN_CENTER);
+    display.drawString(64, 2, "App connectee");
+  }
+
+  if (isOnline()) {
     drawWiFiBars(WiFi.RSSI());
   } else {
-    display.setTextAlignment(TEXT_ALIGN_RIGHT);
-    display.drawString(128, 2, "OFFLINE");
+    drawWiFiBarsDisconnected();
   }
 
   // Zone bleue (y 16-63): valeur CO2 + message
@@ -476,7 +433,7 @@ void displayCO2(int co2) {
   if (co2 > 0) {
     display.drawString(64, valueY, String(co2));
 
-    // "ppm" aligned with the digits like in offline mode
+    // "ppm" aligne verticalement sur les chiffres
     const int ppmY = valueY + (24 - 10) / 2;
     display.setFont(ArialMT_Plain_10);
     display.setTextAlignment(TEXT_ALIGN_LEFT);
@@ -495,52 +452,42 @@ void displayCO2(int co2) {
   display.display();
 }
 
-void displayBLEProvisioning(int co2) {
-  display.clear();
-
-  // Zone jaune (y 0-15): titre
-  display.setFont(ArialMT_Plain_10);
-  display.setTextAlignment(TEXT_ALIGN_LEFT);
-  display.drawString(0, 2, "CO2");
-  drawWiFiBarsDisconnected();
-
-  // Zone bleue (y 16-63): CO2 en grand + info configuration
-  const int valueY = 18;
-  display.setFont(ArialMT_Plain_24);
-  display.setTextAlignment(TEXT_ALIGN_CENTER);
-  if (co2 > 0) {
-    display.drawString(64, valueY, String(co2));
-
-    // Align "ppm" vertically with the digits by centering it on the value.
-    const int ppmY = valueY + (24 - 10) / 2;
-    display.setFont(ArialMT_Plain_10);
-    display.setTextAlignment(TEXT_ALIGN_LEFT);
-    display.drawString(96, ppmY, "ppm");
-
-    display.setTextAlignment(TEXT_ALIGN_CENTER);
-    display.drawString(64, 54, getCO2Message(co2));
-  } else {
-    display.setFont(ArialMT_Plain_16);
-    display.setTextAlignment(TEXT_ALIGN_CENTER);
-    display.drawString(64, 20, "Branchements");
-    display.drawString(64, 40, "incorrects");
-  }
-
-  display.display();
+// CO2 a afficher : 0 si le capteur n'a jamais repondu ou s'est tu.
+int displayedCO2() {
+  if (lastCO2Ok == 0 || millis() - lastCO2Ok > CO2_STALE_MS)
+    return 0;
+  return currentCO2;
 }
 
-void displayError(const char *message) {
-  display.clear();
+void updateDisplay() {
+  if ((long)(millis() - screenHoldUntil) < 0)
+    return; // un verdict WiFi est encore a l'ecran
+  if (bleImprovUiState() == BLE_UI_CONNECTING) {
+    displayWiFiConnecting(String(bleImprovSsid()));
+    return;
+  }
+  displayCO2(displayedCO2());
+}
 
-  // Zone jaune (y 0-15): titre erreur
-  display.setFont(ArialMT_Plain_10);
-  display.setTextAlignment(TEXT_ALIGN_CENTER);
-  display.drawString(64, 2, "ERREUR");
+// Reflete a l'ecran une configuration faite depuis l'app.
+void bleUiLoop() {
+  static BleImprovUiState shown = BLE_UI_OFF;
+  const BleImprovUiState s = bleImprovUiState();
+  if (s == shown)
+    return;
+  shown = s;
 
-  // Zone bleue (y 16-63): message
-  display.setFont(ArialMT_Plain_10);
-  display.drawString(64, 30, message);
-  display.display();
+  if (s == BLE_UI_SUCCESS) {
+    displayWiFiResult(true);
+    holdScreen(2000);
+  } else if (s == BLE_UI_FAILED) {
+    displayWiFiResult(false);
+    holdScreen(2500);
+  } else {
+    // Connexion de l'app, tentative en cours, depart : on repeint tout de
+    // suite plutot qu'au prochain rafraichissement.
+    updateDisplay();
+  }
 }
 
 // ============================================
@@ -552,11 +499,8 @@ void readCO2Sensor() {
 
   if (co2Value > 0) {
     currentCO2 = co2Value;
-    sensorReady = true;
+    lastCO2Ok = millis();
     Serial.printf("CO2: %d ppm\n", currentCO2);
-
-    // Mettre a jour la valeur BLE
-    updateBLECO2Value(currentCO2);
 
     // Accumuler pour la moyenne d'envoi
     co2Sum += (uint32_t)co2Value;
@@ -580,63 +524,194 @@ void readCO2Sensor() {
 }
 
 // ============================================
-// GESTION WiFi PROVISIONING
+// RESEAU
 // ============================================
 
-void handleWiFiConfigReceived() {
-  String ssid = getReceivedSSID();
-  String password = getReceivedPassword();
-  clearReceivedWiFiConfig();
+void setNetState(NetState s) {
+  netState = s;
+  netStateSince = millis();
+}
 
-  Serial.printf("[PROV] Tentative de connexion a: %s\n", ssid.c_str());
-  updateBLEStatus(PROV_CONNECTING);
+// Scanne les reseaux et les depose dans ble_improv, qui les servira a l'app.
+// Bloquant (~2-4 s). JAMAIS avec une app connectee : la radio 2,4 GHz est
+// partagee entre WiFi et Bluetooth (cf. ble_improv.h).
+void scanNetworksForApp() {
+  int n = WiFi.scanNetworks();
+  if (n < 0)
+    n = 0;
+  if (n > 20)
+    n = 20;
 
-  // Afficher sur l'ecran
-  displayWiFiConnecting(ssid);
+  String ssids[20];
+  BleImprovNet nets[20];
+  for (int i = 0; i < n; i++) {
+    ssids[i] = WiFi.SSID(i);
+    nets[i] = {ssids[i].c_str(), (int)WiFi.RSSI(i),
+               WiFi.encryptionType(i) != ENC_TYPE_NONE};
+  }
+  bleImprovPushNetworks(nets, n); // copie : ssids[] sort de portee
+  WiFi.scanDelete();
+}
 
-  // Stocker temporairement
-  wifiSSID = ssid;
-  wifiPassword = password;
+// Premier essai au demarrage, bloquant (le Bluetooth n'est pas encore lance).
+bool connectWiFiAtBoot() {
+  Serial.printf("[WiFi] Connexion a %s...\n", storedSSID.c_str());
+  displayWiFiConnecting(storedSSID);
 
-  if (connectWiFi()) {
-    // Succes: sauvegarder et passer en mode normal
-    updateBLEStatus(PROV_CONNECTED);
-    saveWiFiConfig(ssid, password);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(storedSSID.c_str(), storedPassword.c_str());
 
-    // Recuperer le nom public
-    loadPublicNameFromNVS();
-    if (publicName.length() == 0) {
-      fetchPublicName();
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - start < WIFI_BOOT_TIMEOUT_MS) {
+    delay(250);
+  }
+
+  bool ok = WiFi.status() == WL_CONNECTED;
+  displayWiFiResult(ok);
+  holdScreen(ok ? 1000 : 2000);
+  return ok;
+}
+
+void goOnline() {
+  Serial.printf("[WiFi] En ligne sur %s (IP %s, %d dBm)\n",
+                WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(),
+                (int)WiFi.RSSI());
+  // Nouvelle fenetre de moyenne, premier envoi peu apres : l'app voit vite
+  // arriver les mesures d'un EduKit qu'on vient de configurer.
+  co2Sum = 0;
+  co2SampleCount = 0;
+  nextDataSendAt = millis() + FIRST_SEND_DELAY_MS;
+  setNetState(NET_ONLINE);
+  // Le Bluetooth s'arrete dans loop(), une fois que l'app a eu son verdict
+  // (bleImprovCanStop).
+}
+
+// Hors ligne : on s'annonce en Bluetooth pour que l'app puisse configurer.
+void goOffline() {
+  Serial.println("[WiFi] Hors ligne -> annonce Bluetooth pour l'app");
+  WiFi.disconnect();
+  WiFi.mode(WIFI_STA);
+  // Avant l'annonce : la liste est prete des la premiere connexion de l'app.
+  if (!bleImprovClientConnected())
+    scanNetworksForApp();
+  bleImprovStart(bleName, deviceId);
+  setNetState(NET_OFFLINE);
+}
+
+// L'app a envoye un reseau. ble_improv lit WiFi.status() pour lui donner son
+// verdict ; netLoop() suit ce verdict.
+void onBleCredentials(const String &ssid, const String &password) {
+  Serial.printf("[WiFi] Connexion a '%s' (envoye par l'app)...\n",
+                ssid.c_str());
+  pendingSSID = ssid;
+  pendingPassword = password;
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid.c_str(), password.c_str());
+  setNetState(NET_PROVISIONING);
+}
+
+// Machine a etats reseau, 1 fois par seconde.
+void netLoop() {
+  static unsigned long lastTick = 0;
+  unsigned long now = millis();
+  if (now - lastTick < 1000)
+    return;
+  lastTick = now;
+
+  switch (netState) {
+  case NET_ONLINE:
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("[WiFi] Lien perdu -> reconnexion");
+      WiFi.begin(storedSSID.c_str(), storedPassword.c_str());
+      lastReconnectKick = now;
+      setNetState(NET_RECONNECTING);
     }
+    break;
 
-    // Attendre que l'app lise le statut mis a jour
-    delay(3000);
-
-    // Passer en mode normal
-    stopBLE();
-    delay(500);
-
-    // Redemarrer BLE en mode config
-    initBLEConfigMode(deviceId);
-
-    currentState = STATE_NORMAL;
-    Serial.println("[PROV] -> STATE_NORMAL");
-
-    // Demarrer le timer d'envoi (pas d'envoi immediat)
-    lastDataSend = millis();
-    co2Sum = 0;
-    co2SampleCount = 0;
-  } else {
-    // Echec: rester en provisioning
-    if (WiFi.status() == WL_CONNECT_FAILED) {
-      updateBLEStatus(PROV_WRONG_PASSWORD);
-    } else {
-      updateBLEStatus(PROV_FAILED);
+  case NET_RECONNECTING:
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("[WiFi] Reconnecte (%d dBm)\n", (int)WiFi.RSSI());
+      setNetState(NET_ONLINE);
+    } else if (now - netStateSince > STA_RECONNECT_WINDOW_MS) {
+      Serial.println("[WiFi] 3 min sans reseau");
+      goOffline();
+    } else if (now - lastReconnectKick > STA_RECONNECT_KICK_MS) {
+      WiFi.begin(storedSSID.c_str(), storedPassword.c_str());
+      lastReconnectKick = now;
     }
+    break;
 
-    Serial.println("[PROV] Echec WiFi, retour au provisioning");
-    delay(2000);
-    updateBLEStatus(PROV_IDLE);
+  case NET_OFFLINE:
+    if (now - netStateSince > OFFLINE_RETRY_INTERVAL_MS) {
+      // Jamais sous les pieds de quelqu'un qui configure depuis l'app.
+      if (bleImprovClientConnected() || bleImprovBusy()) {
+        setNetState(NET_OFFLINE); // re-arme, essai dans 10 min
+        break;
+      }
+      scanNetworksForApp(); // liste fraiche pour la prochaine visite de l'app
+      if (storedSSID.length() == 0) {
+        setNetState(NET_OFFLINE);
+        break;
+      }
+      Serial.printf("[WiFi] Nouvel essai de %s en arriere-plan\n",
+                    storedSSID.c_str());
+      WiFi.begin(storedSSID.c_str(), storedPassword.c_str());
+      setNetState(NET_RETRYING);
+    }
+    break;
+
+  case NET_RETRYING:
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("[WiFi] Reseau enregistre retrouve");
+      goOnline();
+    } else if (now - netStateSince > OFFLINE_RETRY_TIMEOUT_MS) {
+      Serial.println("[WiFi] Toujours rien, prochain essai dans 10 min");
+      WiFi.disconnect();
+      setNetState(NET_OFFLINE);
+    }
+    break;
+
+  case NET_PROVISIONING: {
+    // ble_improv tranche (et le dit a l'app) ; on suit son verdict.
+    const BleImprovUiState ble = bleImprovUiState();
+    if (ble == BLE_UI_SUCCESS) {
+      saveWiFiConfig(pendingSSID, pendingPassword);
+      pendingPassword = "";
+      goOnline();
+    } else if (!bleImprovBusy() ||
+               now - netStateSince > PROVISION_TIMEOUT_MS) {
+      // Mauvais mot de passe / reseau absent : on reste visible pour que
+      // l'utilisateur reessaie. Le reseau enregistre n'est pas touche.
+      Serial.println("[WiFi] Reseau de l'app non rejoint");
+      pendingPassword = "";
+      WiFi.disconnect();
+      setNetState(NET_OFFLINE);
+    }
+    break;
+  }
+  }
+}
+
+// ============================================
+// COMMANDES SERIE
+// ============================================
+
+void checkSerialCommands() {
+  if (Serial.available() <= 0)
+    return;
+  char cmd = Serial.read();
+
+  if (cmd == 'r' || cmd == 'R') {
+    forgetWiFiConfig();
+    if (!bleImprovRunning()) {
+      goOffline();
+    } else if (!bleImprovBusy()) {
+      WiFi.disconnect();
+      setNetState(NET_OFFLINE);
+    }
+  } else if (cmd == 'i' || cmd == 'I') {
+    printIdentity();
   }
 }
 
@@ -646,7 +721,11 @@ void handleWiFiConfigReceived() {
 
 void setup() {
   Serial.begin(115200);
-  delay(2000);
+  // Laisse le temps a l'USB de s'enumerer, sans bloquer un EduKit sur batterie.
+  unsigned long serialStart = millis();
+  while (!Serial && millis() - serialStart < 3000) {
+    delay(10);
+  }
   Serial.println();
   Serial.println("================================");
   Serial.println("   KIT PEDAGOGIQUE CO2");
@@ -667,14 +746,15 @@ void setup() {
   // 2. Ecran de chargement
   showLoadingScreen();
 
-  // 3. Generer deviceId
+  // 3. Identite
   generateDeviceId();
+  bleName = "EduKit-" + deviceId;
+  bleImprovOnCredentials(onBleCredentials);
+  loadRefreshRate();
+  loadWiFiConfig();
+  printIdentity();
 
-  // 4. Charger refreshRate depuis NVS
-  int rate = loadRefreshRateFromNVS();
-  Serial.printf("Refresh rate: %d secondes\n", rate);
-
-  // 5. Init capteur CO2
+  // 4. Init capteur CO2
   Serial.println("Initialisation du capteur CO2...");
   Serial1.setRX(S88_RX);
   Serial1.setTX(S88_TX);
@@ -685,47 +765,18 @@ void setup() {
   Serial.println("Premiere lecture du capteur...");
   readCO2Sensor();
 
-  // 6. Verifier NVS pour credentials WiFi
-  if (getStoredWiFiConfig(wifiSSID, wifiPassword)) {
-    // Credentials trouvees, tenter connexion
-    Serial.println("Credentials WiFi trouvees, tentative de connexion...");
-
-    if (connectWiFi()) {
-      // Connecte -> mode NORMAL
-      currentState = STATE_NORMAL;
-      Serial.println("-> STATE_NORMAL");
-
-      // Recuperer/charger le nom public
-      loadPublicNameFromNVS();
-      if (publicName.length() == 0) {
-        fetchPublicName();
-      }
-
-      // Demarrer le timer d'envoi (pas d'envoi immediat)
-      lastDataSend = millis();
-      co2Sum = 0;
-      co2SampleCount = 0;
-
-      // Demarrer BLE en mode config (arriere-plan)
-      initBLEConfigMode(deviceId);
-    } else {
-      // Echec WiFi -> mode provisioning
-      currentState = STATE_BLE_PROVISIONING;
-      Serial.println("Echec WiFi -> STATE_BLE_PROVISIONING");
-      initBLEProvisioning(deviceId);
-    }
+  // 5. Reseau : le reseau enregistre, sinon l'annonce Bluetooth
+  if (storedSSID.length() > 0 && connectWiFiAtBoot()) {
+    goOnline();
   } else {
-    // Pas de credentials -> mode provisioning
-    currentState = STATE_BLE_PROVISIONING;
-    Serial.println("Pas de config WiFi -> STATE_BLE_PROVISIONING");
-    initBLEProvisioning(deviceId);
+    if (storedSSID.length() == 0) {
+      Serial.println("[WiFi] Aucun reseau enregistre");
+    }
+    goOffline();
   }
 
   Serial.println();
   Serial.println("Systeme pret!");
-  if (publicName.length() > 0) {
-    Serial.println("Nom public: " + publicName);
-  }
   Serial.println();
 }
 
@@ -736,64 +787,43 @@ void setup() {
 void loop() {
   unsigned long currentTime = millis();
 
-  // Traitement BLE (toujours actif)
-  processBLE();
+  // Bluetooth et reseau
+  bleImprovLoop();
+  netLoop();
+  // De retour en ligne : on cesse de s'annoncer, une fois le verdict lu.
+  if (bleImprovRunning() && netState == NET_ONLINE && bleImprovCanStop()) {
+    bleImprovStop();
+  }
+  bleUiLoop();
 
-  // Lecture CO2 periodique (dans tous les modes)
+  // Lecture CO2 periodique
   if (currentTime - lastCO2Read >= CO2_READ_INTERVAL) {
     lastCO2Read = currentTime;
     readCO2Sensor();
   }
 
-  switch (currentState) {
-
-  case STATE_BLE_PROVISIONING:
-    // Verifier si config WiFi recue via BLE
-    if (hasReceivedWiFiConfig()) {
-      handleWiFiConfigReceived();
-    }
-
-    // Affichage BLE provisioning
-    if (currentTime - lastDisplayUpdate >= 500) {
-      lastDisplayUpdate = currentTime;
-      displayBLEProvisioning(currentCO2);
-    }
-    break;
-
-  case STATE_NORMAL:
-    // Verifier changement de refresh rate via BLE
-    if (checkAndResetRefreshRateChanged()) {
-      Serial.printf("[MAIN] Refresh rate mis a jour: %d s\n",
-                    getRefreshRateSeconds());
-    }
-
-    // Verifier si config WiFi recue via BLE (reconfig)
-    if (hasReceivedWiFiConfig()) {
-      handleWiFiConfigReceived();
-    }
-
-    // Envoi periodique au serveur
-    if (sensorReady && wifiConnected &&
-        (currentTime - lastDataSend >= getRefreshRateMs())) {
-      lastDataSend = currentTime;
-      int co2ToSend =
-          (co2SampleCount > 0) ? (int)(co2Sum / co2SampleCount) : currentCO2;
-      sendDataToServer(co2ToSend);
+  // Envoi periodique de la moyenne. L'envoi HTTPS bloque quelques secondes :
+  // jamais tant que le Bluetooth doit encore son verdict a l'app.
+  if (netState == NET_ONLINE && WiFi.status() == WL_CONNECTED &&
+      !bleImprovRunning() && (long)(currentTime - nextDataSendAt) >= 0) {
+    nextDataSendAt = currentTime + (unsigned long)refreshRateSeconds * 1000UL;
+    if (co2SampleCount > 0) {
+      int co2Avg = (int)(co2Sum / co2SampleCount);
       co2Sum = 0;
       co2SampleCount = 0;
+      sendDataToServer(co2Avg);
+    } else {
+      Serial.println("[HTTP] Aucune mesure valide, rien a envoyer");
     }
-
-    // Affichage CO2
-    if (currentTime - lastDisplayUpdate >= 500) {
-      lastDisplayUpdate = currentTime;
-      if (sensorReady) {
-        displayCO2(currentCO2);
-      } else {
-        displayError("Capteur non detecte");
-      }
-    }
-    break;
   }
+
+  // Affichage
+  if (currentTime - lastDisplayUpdate >= DISPLAY_INTERVAL) {
+    lastDisplayUpdate = currentTime;
+    updateDisplay();
+  }
+
+  checkSerialCommands();
 
   delay(10);
 }
