@@ -34,6 +34,21 @@ les mesures au serveur AirCarto pour les consulter dans l'app.
 > est branché en USB : sur batterie, il faut alimenter `G+` par la sortie 5V
 > de l'alimentation. Ses lignes UART sont en 3.3V, compatibles avec le Pico.
 
+#### Capteur BME280 (optionnel, I2C1, adresse 0x76 ou 0x77)
+Température, humidité et pression, sur un bus I2C séparé de l'écran : un
+mauvais branchement du BME280 ne bloque pas l'écran. Sans BME280, l'EduKit
+fonctionne comme avant ; avec, l'écran alterne CO2 (8 s) et air ambiant (4 s).
+
+| BME280 | Pico 2 W | Broche physique |
+|--------|----------|-----------------|
+| VCC / VIN | 3V3 (OUT) | 36 |
+| GND  | GND | 8 |
+| SDA  | GPIO 6 (I2C1 SDA) | 9 |
+| SCL  | GPIO 7 (I2C1 SCL) | 10 |
+
+> ⚠️ Prendre un module **BME280** en 3.3V (le BMP280, très ressemblant, ne
+> mesure pas l'humidité).
+
 ## Configuration WiFi depuis l'app AirCarto
 
 L'EduKit parle le même protocole Bluetooth (**Improv WiFi**) que le ModuleAir,
@@ -88,6 +103,7 @@ Sur le moniteur série (115200 bauds) :
 kit-pedagogique-co2/
 ├── platformio.ini          # Configuration PlatformIO (plateforme et coeur épinglés)
 ├── include/
+│   ├── lang.h              # Textes de l'écran, français / anglais
 │   ├── pico_compat.h       # Preferences (ESP32) émulé sur LittleFS
 │   └── version.h           # Version du firmware (voir CHANGELOG.md)
 ├── src/
@@ -97,6 +113,15 @@ kit-pedagogique-co2/
 ├── lib/
 │   └── SensAir_S88/        # Bibliothèque capteur CO2
 └── server/                 # Endpoints PHP (réception, historique, nom public)
+```
+
+## Langue de l'écran
+
+Le firmware existe en français (par défaut) et en anglais, pour les kits livrés à des étudiants anglophones. Les textes de l'écran sont dans `include/lang.h` ; les logs du port série restent en français.
+
+```
+pio run -e pico -t upload      # français
+pio run -e pico_en -t upload   # anglais
 ```
 
 ## Versions

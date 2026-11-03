@@ -21,6 +21,12 @@
  *     - UART_TxD -> GPIO 1 (UART0 RX)
  *     - UART_RxD -> GPIO 0 (UART0 TX)
  *
+ *   BME280 (optionnel, bus I2C separe de l'ecran):
+ *     - VCC      -> 3.3V (3V3 OUT)
+ *     - GND      -> GND
+ *     - SDA      -> GPIO 6 (I2C1 SDA)
+ *     - SCL      -> GPIO 7 (I2C1 SCL)
+ *
  * Note: Le capteur S88 utilise le protocole Modbus RTU a 9600 bauds.
  *
  * OLED bicolore: les 16 premiers pixels (y 0-15) sont jaunes,
@@ -40,8 +46,10 @@
 
 #include "SensAir_S88.h"
 #include "ble_improv.h"
+#include "lang.h"
 #include "pico_compat.h"
 #include "version.h"
+#include <Adafruit_BME280.h>
 #include <Arduino.h>
 #include <HTTPClient.h>
 #include <SSD1306Wire.h>
@@ -75,12 +83,21 @@ String bleName = "";
 #define S88_RX 1 // GPIO1 = UART0 RX
 #define S88_TX 0 // GPIO0 = UART0 TX
 
+// BME280 sur le second bus I2C : un mauvais branchement ne bloque pas l'ecran
+#define BME_SDA 6 // GPIO6 = I2C1 SDA
+#define BME_SCL 7 // GPIO7 = I2C1 SCL
+
 // ============================================
 // CONFIGURATION
 // ============================================
 
 #define CO2_READ_INTERVAL 2000
 #define DISPLAY_INTERVAL 500
+
+// Avec un BME280, l'ecran alterne : CO2 pendant 8 s, temperature, humidite et
+// pression pendant 4 s.
+#define SCREEN_CO2_MS 8000UL
+#define SCREEN_ENV_MS 4000UL
 // Sans mesure valide depuis ce delai, on cesse d'afficher la derniere valeur
 // (capteur debranche en cours de route).
 #define CO2_STALE_MS 10000
@@ -130,6 +147,14 @@ String pendingPassword = "";
 
 SSD1306Wire display(OLED_ADDRESS, OLED_SDA, OLED_SCL);
 SensAir_S88 co2Sensor;
+Adafruit_BME280 bme;
+
+// BME280 : present si detecte au demarrage, mesure valide si plausible
+bool bmePresent = false;
+bool bmeOk = false;
+float bmeTemperature = 0;
+float bmeHumidity = 0;
+float bmePressure = 0; // hPa
 
 // Variables
 int currentCO2 = 0;
@@ -158,12 +183,10 @@ void showLoadingScreen() {
     // Zone jaune (0-15): titre
     display.setFont(ArialMT_Plain_10);
     display.setTextAlignment(TEXT_ALIGN_CENTER);
-    display.drawString(64, 2, "ATELIER PEDAGOGIQUE");
+    display.drawString(64, 2, TXT_BOOT_TITLE);
 
-    // Version du firmware, pour l'assistance
-    display.drawString(64, 22, "v" FIRMWARE_VERSION);
-
-    // Zone bleue (16-63): barre de progression
+    // Zone bleue (16-63): pourcentage, barre de progression, version
+    display.drawString(64, 26, String(progress) + "%");
     display.drawRect(progressBarX, progressBarY, progressBarWidth,
                      progressBarHeight);
 
@@ -171,8 +194,8 @@ void showLoadingScreen() {
     display.fillRect(progressBarX + 2, progressBarY + 2, fillWidth,
                      progressBarHeight - 4);
 
-    display.setFont(ArialMT_Plain_10);
-    display.drawString(64, 52, String(progress) + "%");
+    // Version du firmware sous la barre, pour l'assistance
+    display.drawString(64, 52, "v" FIRMWARE_VERSION);
 
     display.display();
     delay(100);
@@ -204,6 +227,7 @@ void printIdentity() {
   Serial.printf("  Reseau     : %s\n",
                 storedSSID.length() ? storedSSID.c_str() : "(aucun)");
   Serial.printf("  Envoi      : toutes les %d s\n", refreshRateSeconds);
+  Serial.printf("  BME280     : %s\n", bmePresent ? "detecte" : "absent");
   Serial.println("================================");
 }
 
@@ -274,6 +298,11 @@ int sendDataToServer(int co2Value) {
   jsonPayload += "\"device_id\":\"" + deviceId + "\",";
   jsonPayload += "\"signal_quality\":" + String(WiFi.RSSI()) + ",";
   jsonPayload += "\"co2\":" + String(co2Value) + ",";
+  if (bmeOk) {
+    jsonPayload += "\"temperature\":" + String(bmeTemperature, 1) + ",";
+    jsonPayload += "\"humidity\":" + String(bmeHumidity, 1) + ",";
+    jsonPayload += "\"pressure\":" + String(bmePressure, 1) + ",";
+  }
   jsonPayload += "\"firmware_version\":\"" FIRMWARE_VERSION "\"";
   jsonPayload += "}";
 
@@ -321,12 +350,12 @@ void holdScreen(unsigned long ms) { screenHoldUntil = millis() + ms; }
 
 const char *getCO2Message(int co2) {
   if (co2 > -1 && co2 < CO2_GOOD)
-    return "BIEN";
+    return TXT_CO2_GOOD;
   if (co2 >= CO2_GOOD && co2 < CO2_BAD)
-    return "AERER SVP";
+    return TXT_CO2_VENTILATE;
   if (co2 >= CO2_BAD)
-    return "AERER SVP";
-  return "ERREUR";
+    return TXT_CO2_VENTILATE;
+  return TXT_CO2_ERROR;
 }
 
 void displayWiFiConnecting(const String &ssid) {
@@ -335,13 +364,13 @@ void displayWiFiConnecting(const String &ssid) {
   // Zone jaune (0-15): titre
   display.setFont(ArialMT_Plain_10);
   display.setTextAlignment(TEXT_ALIGN_CENTER);
-  display.drawString(64, 2, "Connexion WiFi");
+  display.drawString(64, 2, TXT_WIFI_CONNECTING);
 
   // Zone bleue (16-63): SSID
   display.setFont(ArialMT_Plain_16);
   display.drawString(64, 24, ssid);
   display.setFont(ArialMT_Plain_10);
-  display.drawString(64, 48, "Veuillez patienter...");
+  display.drawString(64, 48, TXT_PLEASE_WAIT);
   display.display();
 }
 
@@ -351,13 +380,13 @@ void displayWiFiResult(bool connected) {
   // Zone jaune (0-15): titre
   display.setFont(ArialMT_Plain_10);
   display.setTextAlignment(TEXT_ALIGN_CENTER);
-  display.drawString(64, 2, "WiFi");
+  display.drawString(64, 2, TXT_WIFI_RESULT_TITLE);
 
   // Zone bleue (16-63): statut
   display.setFont(ArialMT_Plain_16);
   display.setTextAlignment(TEXT_ALIGN_CENTER);
-  display.drawString(64, 22, "Connexion");
-  display.drawString(64, 40, connected ? "etablie" : "echouee");
+  display.drawString(64, 22, TXT_CONNECTION);
+  display.drawString(64, 40, connected ? TXT_CONNECTION_OK : TXT_CONNECTION_FAILED);
   display.display();
 }
 
@@ -419,7 +448,7 @@ void displayCO2(int co2) {
 
   if (bleImprovUiState() == BLE_UI_LINKED) {
     display.setTextAlignment(TEXT_ALIGN_CENTER);
-    display.drawString(64, 2, "App connectee");
+    display.drawString(64, 2, TXT_APP_LINKED);
   }
 
   if (isOnline()) {
@@ -448,11 +477,48 @@ void displayCO2(int co2) {
   } else {
     display.setFont(ArialMT_Plain_16);
     display.setTextAlignment(TEXT_ALIGN_CENTER);
-    display.drawString(64, 20, "Branchements");
-    display.drawString(64, 40, "incorrects");
+    display.drawString(64, 20, TXT_WIRING_1);
+    display.drawString(64, 40, TXT_WIRING_2);
   }
 
   display.display();
+}
+
+void displayEnvironment() {
+  display.clear();
+
+  // Zone jaune (y 0-15): titre et indicateur WiFi
+  display.setFont(ArialMT_Plain_10);
+  display.setTextAlignment(TEXT_ALIGN_LEFT);
+  display.drawString(0, 2, TXT_ENV_TITLE);
+  if (isOnline()) {
+    drawWiFiBars(WiFi.RSSI());
+  } else {
+    drawWiFiBarsDisconnected();
+  }
+
+  // Zone bleue (y 16-63): temperature et humidite, puis pression
+  display.setFont(ArialMT_Plain_16);
+  display.setTextAlignment(TEXT_ALIGN_CENTER);
+  if (bmeOk) {
+    display.drawString(64, 20,
+                       String(bmeTemperature, 1) + " C   " +
+                           String((int)(bmeHumidity + 0.5f)) + " %");
+    display.drawString(64, 42, String((int)(bmePressure + 0.5f)) + " hPa");
+  } else {
+    display.drawString(64, 20, TXT_WIRING_1);
+    display.drawString(64, 40, TXT_WIRING_2);
+  }
+
+  display.display();
+}
+
+// Avec un BME280, l'ecran CO2 laisse regulierement la place aux mesures
+// d'ambiance.
+bool showEnvironmentNow() {
+  if (!bmePresent)
+    return false;
+  return millis() % (SCREEN_CO2_MS + SCREEN_ENV_MS) >= SCREEN_CO2_MS;
 }
 
 // CO2 a afficher : 0 si le capteur n'a jamais repondu ou s'est tu.
@@ -467,6 +533,10 @@ void updateDisplay() {
     return; // un verdict WiFi est encore a l'ecran
   if (bleImprovUiState() == BLE_UI_CONNECTING) {
     displayWiFiConnecting(String(bleImprovSsid()));
+    return;
+  }
+  if (showEnvironmentNow()) {
+    displayEnvironment();
     return;
   }
   displayCO2(displayedCO2());
@@ -523,6 +593,26 @@ void readCO2Sensor() {
       Serial.println("  -> Reponse invalide");
       break;
     }
+  }
+}
+
+void readBME280() {
+  if (!bmePresent)
+    return;
+  float t = bme.readTemperature();
+  float h = bme.readHumidity();
+  float p = bme.readPressure() / 100.0f;
+
+  // Un capteur debranche en cours de route rend des valeurs hors limites
+  bmeOk = !isnan(t) && !isnan(h) && !isnan(p) && t > -40 && t < 85 &&
+          h >= 0 && h <= 100 && p > 300 && p < 1100;
+  if (bmeOk) {
+    bmeTemperature = t;
+    bmeHumidity = h;
+    bmePressure = p;
+    Serial.printf("BME280: %.1f C, %.1f %%, %.1f hPa\n", t, h, p);
+  } else {
+    Serial.println("Erreur lecture BME280");
   }
 }
 
@@ -774,6 +864,14 @@ void setup() {
   Serial.println("Premiere lecture du capteur...");
   readCO2Sensor();
 
+  // 4b. BME280 optionnel, sur son propre bus I2C (adresse 0x76 ou 0x77)
+  Wire1.setSDA(BME_SDA);
+  Wire1.setSCL(BME_SCL);
+  Wire1.begin();
+  bmePresent = bme.begin(0x76, &Wire1) || bme.begin(0x77, &Wire1);
+  Serial.printf("BME280 %s\n", bmePresent ? "detecte" : "absent");
+  readBME280();
+
   // 5. Reseau : le reseau enregistre, sinon l'annonce Bluetooth
   if (storedSSID.length() > 0 && connectWiFiAtBoot()) {
     goOnline();
@@ -809,6 +907,7 @@ void loop() {
   if (currentTime - lastCO2Read >= CO2_READ_INTERVAL) {
     lastCO2Read = currentTime;
     readCO2Sensor();
+    readBME280();
   }
 
   // Envoi periodique de la moyenne. L'envoi HTTPS bloque quelques secondes :

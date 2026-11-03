@@ -12,8 +12,14 @@ Les données des EduKit arrivent sous ce format:
     "device_id": "4430353234313938",
     "signal_quality": -22,
     "co2": 793.00,
-    "firmware_version": "2.1.0"
+    "firmware_version": "2.1.0",
+    "temperature": 21.4,
+    "humidity": 45.2,
+    "pressure": 1013.2
   }
+
+temperature (°C), humidity (%) et pressure (hPa) : optionnels, envoyes par
+les EduKit equipes d'un BME280, ecrits dans InfluxDB avec le CO2.
 
 firmware_version (optionnel, firmware 2.1.0 et suivants) est ecrit dans
 capteurs.firmware_version ; absent ou mal forme, la valeur en base est gardee.
@@ -56,6 +62,7 @@ $signal = -1;
 $nom_capteur = "";
 $local_ip = "";
 $firmware_version = "";
+$bme_fields = ""; // champs InfluxDB du BME280, ",temperature=21.4,..."
 
 // ============================================
 // FONCTION DE REPONSE JSON
@@ -214,6 +221,14 @@ if (isset($json_decoded["firmware_version"]) && is_string($json_decoded["firmwar
     if ($needToLog) { error_log("[EduKit] Firmware: " . $firmware_version, 0); }
 }
 
+// BME280 (optionnel) : un champ n'est garde que s'il est numerique
+foreach (["temperature", "humidity", "pressure"] as $field) {
+    if (isset($json_decoded[$field]) && is_numeric($json_decoded[$field])) {
+        $bme_fields .= "," . $field . "=" . floatval($json_decoded[$field]);
+    }
+}
+if ($needToLog && $bme_fields !== "") { error_log("[EduKit] BME280:" . $bme_fields, 0); }
+
 // ============================================
 // MISE A JOUR POSTGRESQL
 // ============================================
@@ -276,7 +291,7 @@ if ($sendToPublicCloud) {
         $writeApi = $client->createWriteApi();
 
         // Format line protocol: measurement,tags fields
-        $data = "" . $nom_capteur . ",sensorId=" . $nom_capteur . " co2=" . $co2 . "";
+        $data = "" . $nom_capteur . ",sensorId=" . $nom_capteur . " co2=" . $co2 . $bme_fields;
 
         $writeApi->write($data, WritePrecision::S, $bucket, $org);
         $client->close();
@@ -298,7 +313,7 @@ if ($sendToServerLab_1) {
         ]);
 
         $writeApi = $client->createWriteApi();
-        $data = "" . $nom_capteur . ",sensorId=" . $nom_capteur . " co2=" . $co2 . "";
+        $data = "" . $nom_capteur . ",sensorId=" . $nom_capteur . " co2=" . $co2 . $bme_fields;
         $writeApi->write($data, WritePrecision::S, $bucket, $org);
         $client->close();
         $influxSuccess = true;
@@ -319,7 +334,7 @@ if ($sendToServerLab_2) {
         ]);
 
         $writeApi = $client->createWriteApi();
-        $data = "" . $nom_capteur . ",sensorId=" . $nom_capteur . " co2=" . $co2 . "";
+        $data = "" . $nom_capteur . ",sensorId=" . $nom_capteur . " co2=" . $co2 . $bme_fields;
         $writeApi->write($data, WritePrecision::S, $bucket, $org);
         $client->close();
         $influxSuccess = true;
