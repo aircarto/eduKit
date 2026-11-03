@@ -851,7 +851,6 @@ void setup() {
   bleImprovOnCredentials(onBleCredentials);
   loadRefreshRate();
   loadWiFiConfig();
-  printIdentity();
 
   // 4. Init capteur CO2
   Serial.println("Initialisation du capteur CO2...");
@@ -871,6 +870,9 @@ void setup() {
   bmePresent = bme.begin(0x76, &Wire1) || bme.begin(0x77, &Wire1);
   Serial.printf("BME280 %s\n", bmePresent ? "detecte" : "absent");
   readBME280();
+
+  // Identite apres la detection du BME280, pour qu'elle le mentionne
+  printIdentity();
 
   // 5. Reseau : le reseau enregistre, sinon l'annonce Bluetooth
   if (storedSSID.length() > 0 && connectWiFiAtBoot()) {
