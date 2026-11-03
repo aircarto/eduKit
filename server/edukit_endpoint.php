@@ -11,8 +11,12 @@ Les données des EduKit arrivent sous ce format:
   {
     "device_id": "4430353234313938",
     "signal_quality": -22,
-    "co2": 793.00
+    "co2": 793.00,
+    "firmware_version": "2.1.0"
   }
+
+firmware_version (optionnel, firmware 2.1.0 et suivants) est ecrit dans
+capteurs.firmware_version ; absent ou mal forme, la valeur en base est gardee.
 
 Codes de retour:
   - 200: OK, données enregistrées
@@ -51,6 +55,7 @@ $lon = -1;
 $signal = -1;
 $nom_capteur = "";
 $local_ip = "";
+$firmware_version = "";
 
 // ============================================
 // FONCTION DE REPONSE JSON
@@ -202,6 +207,13 @@ if (isset($json_decoded["local_ip"])) {
     $local_ip = $json_decoded["local_ip"];
 }
 
+// Version du firmware (optionnel) : MAJEUR.MINEUR.CORRECTIF, 20 caracteres au plus
+if (isset($json_decoded["firmware_version"]) && is_string($json_decoded["firmware_version"])
+    && preg_match('/^\d{1,5}\.\d{1,5}\.\d{1,5}$/', $json_decoded["firmware_version"])) {
+    $firmware_version = $json_decoded["firmware_version"];
+    if ($needToLog) { error_log("[EduKit] Firmware: " . $firmware_version, 0); }
+}
+
 // ============================================
 // MISE A JOUR POSTGRESQL
 // ============================================
@@ -214,7 +226,9 @@ last_seen_utc = '$fullDateUTC',
 type_conn = 'WIFI',
 wifi_signal = '$signal',
 co2_last = '$co2',
-local_ip = '$local_ip' 
+local_ip = '$local_ip'" .
+($firmware_version !== "" ? ",
+firmware_version = '" . pg_escape_string($firmware_version) . "'" : "") . "
 WHERE nom ='" . pg_escape_string($nom_capteur) . "'";
 
 $pgUpdateSuccess = false;
@@ -329,6 +343,7 @@ sendJsonResponse(200, "success", "Donnees enregistrees avec succes", [
     "sensor" => $nom_capteur,
     "co2" => $co2,
     "signal" => $signal,
+    "firmware_version" => $firmware_version,
     "timestamp" => $fullDate,
     "influx_updated" => $influxSuccess
 ]);

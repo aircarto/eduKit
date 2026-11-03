@@ -41,6 +41,7 @@
 #include "SensAir_S88.h"
 #include "ble_improv.h"
 #include "pico_compat.h"
+#include "version.h"
 #include <Arduino.h>
 #include <HTTPClient.h>
 #include <SSD1306Wire.h>
@@ -48,8 +49,6 @@
 #include <WiFiClientSecure.h>
 #include <Wire.h>
 #include <pico/unique_id.h>
-
-#define FIRMWARE_VERSION "2.0.0"
 
 // ============================================
 // CONFIGURATION SERVEUR
@@ -161,6 +160,9 @@ void showLoadingScreen() {
     display.setTextAlignment(TEXT_ALIGN_CENTER);
     display.drawString(64, 2, "ATELIER PEDAGOGIQUE");
 
+    // Version du firmware, pour l'assistance
+    display.drawString(64, 22, "v" FIRMWARE_VERSION);
+
     // Zone bleue (16-63): barre de progression
     display.drawRect(progressBarX, progressBarY, progressBarWidth,
                      progressBarHeight);
@@ -271,7 +273,8 @@ int sendDataToServer(int co2Value) {
   String jsonPayload = "{";
   jsonPayload += "\"device_id\":\"" + deviceId + "\",";
   jsonPayload += "\"signal_quality\":" + String(WiFi.RSSI()) + ",";
-  jsonPayload += "\"co2\":" + String(co2Value);
+  jsonPayload += "\"co2\":" + String(co2Value) + ",";
+  jsonPayload += "\"firmware_version\":\"" FIRMWARE_VERSION "\"";
   jsonPayload += "}";
 
   Serial.printf("[HTTP] Payload: %s\n", jsonPayload.c_str());

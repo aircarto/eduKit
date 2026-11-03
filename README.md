@@ -88,7 +88,8 @@ Sur le moniteur série (115200 bauds) :
 kit-pedagogique-co2/
 ├── platformio.ini          # Configuration PlatformIO (plateforme et coeur épinglés)
 ├── include/
-│   └── pico_compat.h       # Preferences (ESP32) émulé sur LittleFS
+│   ├── pico_compat.h       # Preferences (ESP32) émulé sur LittleFS
+│   └── version.h           # Version du firmware (voir CHANGELOG.md)
 ├── src/
 │   ├── main.cpp            # Capteur, écran, machine à états réseau, envoi
 │   ├── ble_improv.h        # Configuration WiFi par Bluetooth (Improv)
@@ -97,6 +98,10 @@ kit-pedagogique-co2/
 │   └── SensAir_S88/        # Bibliothèque capteur CO2
 └── server/                 # Endpoints PHP (réception, historique, nom public)
 ```
+
+## Versions
+
+La version du firmware est définie dans `include/version.h` (MAJEUR.MINEUR.CORRECTIF). Elle s'affiche sur l'écran de démarrage et avec la commande `i`, et part au serveur avec chaque mesure (champ `firmware_version`, enregistré dans `capteurs.firmware_version`). À chaque firmware distribué : changer la version et ajouter une entrée dans `CHANGELOG.md`.
 
 ## Erreurs Communes
 
