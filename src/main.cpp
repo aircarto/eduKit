@@ -720,6 +720,12 @@ void checkSerialCommands() {
 // ============================================
 
 void setup() {
+  // Temoin d'alimentation : la LED du Pico s'allume des le demarrage, pour que
+  // les eleves voient tout de suite que le 5V et le GND sont bien branches.
+  // Sur le Pico 2 W elle est reliee a la puce CYW43, LED_BUILTIN la pilote.
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH);
+
   Serial.begin(115200);
   // Laisse le temps a l'USB de s'enumerer, sans bloquer un EduKit sur batterie.
   unsigned long serialStart = millis();
