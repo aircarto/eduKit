@@ -7,7 +7,7 @@
  * donne le firmware francais, "pico_en" (-DLANG_EN) le firmware anglais.
  *   pio run -e pico_en -t upload
  *
- * Pas d'accents : la police de l'ecran ne les affiche pas.
+ * Textes sans accents, comme le reste du firmware.
  * Les logs du port serie restent en francais.
  */
 
@@ -26,7 +26,7 @@
 #define TXT_CO2_GOOD "GOOD"
 #define TXT_CO2_VENTILATE "VENTILATE"
 #define TXT_CO2_ERROR "ERROR"
-#define TXT_ENV_TITLE "Ambient air"
+#define TXT_DECIMAL_SEP "."
 
 #else
 
@@ -43,6 +43,6 @@
 #define TXT_CO2_GOOD "BIEN"
 #define TXT_CO2_VENTILATE "AERER SVP"
 #define TXT_CO2_ERROR "ERREUR"
-#define TXT_ENV_TITLE "Air ambiant"
+#define TXT_DECIMAL_SEP ","
 
 #endif

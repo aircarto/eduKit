@@ -93,11 +93,6 @@ String bleName = "";
 
 #define CO2_READ_INTERVAL 2000
 #define DISPLAY_INTERVAL 500
-
-// Avec un BME280, l'ecran alterne : CO2 pendant 8 s, temperature, humidite et
-// pression pendant 4 s.
-#define SCREEN_CO2_MS 8000UL
-#define SCREEN_ENV_MS 4000UL
 // Sans mesure valide depuis ce delai, on cesse d'afficher la derniere valeur
 // (capteur debranche en cours de route).
 #define CO2_STALE_MS 10000
@@ -107,7 +102,9 @@ String bleName = "";
 #define CO2_BAD 1500
 
 // Rythmes reseau (ceux de l'Alba / ModuleAir_V4)
-#define WIFI_BOOT_TIMEOUT_MS 20000UL              // essai au demarrage
+#define WIFI_BOOT_TIMEOUT_MS 30000UL              // essais au demarrage
+#define WIFI_BOOT_ATTEMPTS 4                      // tentatives dans ce delai
+#define WIFI_EARLY_FAIL_MS 2500UL // status() est du bruit juste apres begin
 #define STA_RECONNECT_WINDOW_MS (3UL * 60 * 1000) // lien perdu : 3 min d'essais
 #define STA_RECONNECT_KICK_MS 30000UL             // relance du driver
 #define OFFLINE_RETRY_INTERVAL_MS (10UL * 60 * 1000)
@@ -441,14 +438,24 @@ void drawWiFiBarsDisconnected() { drawWiFiBarsWithLevel(0, true); }
 void displayCO2(int co2) {
   display.clear();
 
-  // Zone jaune (y 0-15): "CO2", etat de l'app et indicateur WiFi
+  // Zone jaune (y 0-15): "CO2" (descendu pres de la valeur avec un BME280),
+  // etat de l'app (sinon temperature et humidite du BME280) et indicateur WiFi
   display.setFont(ArialMT_Plain_10);
-  display.setTextAlignment(TEXT_ALIGN_LEFT);
-  display.drawString(0, 2, "CO2");
+  if (!bmePresent) {
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    display.drawString(0, 2, "CO2");
+  }
 
   if (bleImprovUiState() == BLE_UI_LINKED) {
     display.setTextAlignment(TEXT_ALIGN_CENTER);
     display.drawString(64, 2, TXT_APP_LINKED);
+  } else if (bmeOk) {
+    String temperature = String(bmeTemperature, 1);
+    temperature.replace(".", TXT_DECIMAL_SEP);
+    display.setTextAlignment(TEXT_ALIGN_CENTER);
+    display.drawString(66, 2,
+                       temperature + "°C  " +
+                           String((int)(bmeHumidity + 0.5f)) + "%");
   }
 
   if (isOnline()) {
@@ -471,6 +478,12 @@ void displayCO2(int co2) {
     display.setTextAlignment(TEXT_ALIGN_LEFT);
     display.drawString(96, ppmY, "ppm");
 
+    // Avec un BME280, le haut de l'ecran est pris : "CO2" a gauche de la valeur
+    if (bmePresent) {
+      display.setTextAlignment(TEXT_ALIGN_RIGHT);
+      display.drawString(32, ppmY, "CO2");
+    }
+
     display.setFont(ArialMT_Plain_16);
     display.setTextAlignment(TEXT_ALIGN_CENTER);
     display.drawString(64, 46, getCO2Message(co2));
@@ -482,43 +495,6 @@ void displayCO2(int co2) {
   }
 
   display.display();
-}
-
-void displayEnvironment() {
-  display.clear();
-
-  // Zone jaune (y 0-15): titre et indicateur WiFi
-  display.setFont(ArialMT_Plain_10);
-  display.setTextAlignment(TEXT_ALIGN_LEFT);
-  display.drawString(0, 2, TXT_ENV_TITLE);
-  if (isOnline()) {
-    drawWiFiBars(WiFi.RSSI());
-  } else {
-    drawWiFiBarsDisconnected();
-  }
-
-  // Zone bleue (y 16-63): temperature et humidite, puis pression
-  display.setFont(ArialMT_Plain_16);
-  display.setTextAlignment(TEXT_ALIGN_CENTER);
-  if (bmeOk) {
-    display.drawString(64, 20,
-                       String(bmeTemperature, 1) + " C   " +
-                           String((int)(bmeHumidity + 0.5f)) + " %");
-    display.drawString(64, 42, String((int)(bmePressure + 0.5f)) + " hPa");
-  } else {
-    display.drawString(64, 20, TXT_WIRING_1);
-    display.drawString(64, 40, TXT_WIRING_2);
-  }
-
-  display.display();
-}
-
-// Avec un BME280, l'ecran CO2 laisse regulierement la place aux mesures
-// d'ambiance.
-bool showEnvironmentNow() {
-  if (!bmePresent)
-    return false;
-  return millis() % (SCREEN_CO2_MS + SCREEN_ENV_MS) >= SCREEN_CO2_MS;
 }
 
 // CO2 a afficher : 0 si le capteur n'a jamais repondu ou s'est tu.
@@ -533,10 +509,6 @@ void updateDisplay() {
     return; // un verdict WiFi est encore a l'ecran
   if (bleImprovUiState() == BLE_UI_CONNECTING) {
     displayWiFiConnecting(String(bleImprovSsid()));
-    return;
-  }
-  if (showEnvironmentNow()) {
-    displayEnvironment();
     return;
   }
   displayCO2(displayedCO2());
@@ -647,20 +619,51 @@ void scanNetworksForApp() {
 }
 
 // Premier essai au demarrage, bloquant (le Bluetooth n'est pas encore lance).
+// Dit pourquoi une tentative a echoue. WL_CONNECT_FAILED regroupe mot de passe
+// refuse, association ratee et reseau perdu en route (lwIP_CYW43.cpp).
+void logWiFiFailure(int attempt, unsigned long elapsedMs) {
+  int st = WiFi.status();
+  const char *why = "delai depasse (reseau trop loin ou lent a repondre ?)";
+  if (st == WL_NO_SSID_AVAIL)
+    why = "reseau introuvable";
+  else if (st == WL_CONNECT_FAILED)
+    why = "connexion refusee ou interrompue";
+  Serial.printf("[WiFi] Essai %d echoue apres %lu ms : %s (statut %d)\n",
+                attempt, elapsedMs, why, st);
+}
+
+// Apres un redemarrage brutal (flash, debranchement), la borne garde parfois
+// l'ancienne association et refuse le premier essai : on retente, avec une
+// deconnexion propre entre deux essais.
 bool connectWiFiAtBoot() {
   Serial.printf("[WiFi] Connexion a %s...\n", storedSSID.c_str());
   displayWiFiConnecting(storedSSID);
 
   WiFi.mode(WIFI_STA);
-  WiFi.begin(storedSSID.c_str(), storedPassword.c_str());
-
   unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED &&
-         millis() - start < WIFI_BOOT_TIMEOUT_MS) {
-    delay(250);
+  bool ok = false;
+  for (int attempt = 1;
+       attempt <= WIFI_BOOT_ATTEMPTS && millis() - start < WIFI_BOOT_TIMEOUT_MS;
+       attempt++) {
+    unsigned long attemptStart = millis();
+    WiFi.beginNoBlock(storedSSID.c_str(), storedPassword.c_str());
+    while (millis() - start < WIFI_BOOT_TIMEOUT_MS) {
+      int st = WiFi.status();
+      if (st == WL_CONNECTED)
+        break;
+      if ((st == WL_CONNECT_FAILED || st == WL_NO_SSID_AVAIL) &&
+          millis() - attemptStart > WIFI_EARLY_FAIL_MS)
+        break;
+      delay(250);
+    }
+    ok = WiFi.status() == WL_CONNECTED;
+    if (ok)
+      break;
+    logWiFiFailure(attempt, millis() - attemptStart);
+    WiFi.disconnect();
+    delay(1000);
   }
 
-  bool ok = WiFi.status() == WL_CONNECTED;
   displayWiFiResult(ok);
   holdScreen(ok ? 1000 : 2000);
   return ok;

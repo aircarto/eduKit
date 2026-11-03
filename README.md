@@ -37,7 +37,8 @@ les mesures au serveur AirCarto pour les consulter dans l'app.
 #### Capteur BME280 (optionnel, I2C1, adresse 0x76 ou 0x77)
 Température, humidité et pression, sur un bus I2C séparé de l'écran : un
 mauvais branchement du BME280 ne bloque pas l'écran. Sans BME280, l'EduKit
-fonctionne comme avant ; avec, l'écran alterne CO2 (8 s) et air ambiant (4 s).
+fonctionne comme avant ; avec, la température et l'humidité s'affichent en haut
+de l'écran (`29,1°C  34%`), la pression est seulement envoyée au serveur.
 
 | BME280 | Pico 2 W | Broche physique |
 |--------|----------|-----------------|
@@ -45,6 +46,9 @@ fonctionne comme avant ; avec, l'écran alterne CO2 (8 s) et air ambiant (4 s).
 | GND  | GND | 8 |
 | SDA  | GPIO 6 (I2C1 SDA) | 9 |
 | SCL  | GPIO 7 (I2C1 SCL) | 10 |
+
+Sur le module à 6 broches (SDO, CSB, SDA, SCL, GND, VCC), SDO et CSB restent
+libres : le firmware cherche le capteur aux deux adresses.
 
 > ⚠️ Prendre un module **BME280** en 3.3V (le BMP280, très ressemblant, ne
 > mesure pas l'humidité).
@@ -96,6 +100,24 @@ Sur le moniteur série (115200 bauds) :
 - **≥ 800 ppm** : « AERER SVP »
 - En haut à droite : barres de signal WiFi, ou icône barrée hors ligne.
 - « Branchements incorrects » : aucune mesure valide du capteur depuis 10 s.
+
+## Mesures et envoi
+
+| Quoi | Rythme |
+|------|--------|
+| Lecture du CO2 et du BME280 | toutes les 2 s |
+| Rafraîchissement de l'écran | toutes les 0,5 s (la valeur change toutes les 2 s) |
+| Envoi au serveur | toutes les 60 s |
+| Premier envoi après la connexion WiFi | 15 s après |
+| « Branchements incorrects » | aucune mesure valide du CO2 depuis 10 s |
+
+Le CO2 envoyé est la **moyenne** des lectures faites depuis le dernier envoi ;
+la température, l'humidité et la pression envoyées sont les **dernières
+valeurs** lues.
+
+L'intervalle d'envoi est lu dans la mémoire du Pico (clé `refresh_rate` :
+10, 30 ou 60 s, 60 par défaut). Aucune commande du firmware 2.x ne le change :
+il reste à 60 s, sauf sur un EduKit réglé autrement avec un firmware 1.x.
 
 ## Structure du Projet
 
