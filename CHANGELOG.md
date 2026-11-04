@@ -4,6 +4,14 @@ La version est definie dans `include/version.h` (MAJEUR.MINEUR.CORRECTIF).
 Elle s'affiche sur l'ecran de demarrage, avec la commande serie `i`, et part
 au serveur avec chaque mesure (`firmware_version`).
 
+## 2.1.2
+
+- WiFi : scan des reseaux (~1 s) avant de tenter le reseau enregistre. Absent
+  de deux scans (atelier ailleurs), un seul essai au lieu de 4 : le Bluetooth
+  est pret pour l'app en ~5 s au lieu de ~14 s, et le port serie dit que le
+  reseau est introuvable. Hors ligne, le nouvel essai toutes les 10 min est
+  saute si le reseau n'est pas a portee.
+
 ## 2.1.1
 
 - WiFi au demarrage : jusqu'a 4 essais en 30 s au lieu d'un seul. Apres un

@@ -600,10 +600,23 @@ void setNetState(NetState s) {
 // Scanne les reseaux et les depose dans ble_improv, qui les servira a l'app.
 // Bloquant (~2-4 s). JAMAIS avec une app connectee : la radio 2,4 GHz est
 // partagee entre WiFi et Bluetooth (cf. ble_improv.h).
-void scanNetworksForApp() {
+// Dit au passage si le reseau enregistre est a portee : SCAN_SEEN, SCAN_ABSENT,
+// ou SCAN_UNKNOWN quand le scan n'a rien rendu (erreur, radio occupee).
+enum ScanResult { SCAN_UNKNOWN, SCAN_SEEN, SCAN_ABSENT };
+
+ScanResult scanNetworksForApp() {
   int n = WiFi.scanNetworks();
   if (n < 0)
     n = 0;
+
+  ScanResult seen = n > 0 ? SCAN_ABSENT : SCAN_UNKNOWN;
+  for (int i = 0; i < n && storedSSID.length() > 0; i++) {
+    if (WiFi.SSID(i) == storedSSID) {
+      seen = SCAN_SEEN;
+      break;
+    }
+  }
+
   if (n > 20)
     n = 20;
 
@@ -616,6 +629,7 @@ void scanNetworksForApp() {
   }
   bleImprovPushNetworks(nets, n); // copie : ssids[] sort de portee
   WiFi.scanDelete();
+  return seen;
 }
 
 // Premier essai au demarrage, bloquant (le Bluetooth n'est pas encore lance).
@@ -635,15 +649,30 @@ void logWiFiFailure(int attempt, unsigned long elapsedMs) {
 // Apres un redemarrage brutal (flash, debranchement), la borne garde parfois
 // l'ancienne association et refuse le premier essai : on retente, avec une
 // deconnexion propre entre deux essais.
+// Le driver ne distingue pas un reseau absent d'un refus (statut 4 dans les
+// deux cas) : un scan prealable (~1 s) dit si le reseau est la. Absent de deux
+// scans (atelier ailleurs), un seul essai court, pour un eventuel reseau
+// masque, au lieu de 4 essais (~14 s) avant le Bluetooth.
 bool connectWiFiAtBoot() {
   Serial.printf("[WiFi] Connexion a %s...\n", storedSSID.c_str());
   displayWiFiConnecting(storedSSID);
 
   WiFi.mode(WIFI_STA);
+  int attempts = WIFI_BOOT_ATTEMPTS;
+  ScanResult seen = scanNetworksForApp();
+  if (seen == SCAN_ABSENT)
+    seen = scanNetworksForApp(); // un scan rate parfois une borne
+  if (seen == SCAN_ABSENT) {
+    Serial.printf("[WiFi] %s introuvable au scan : un seul essai (reseau "
+                  "masque ?)\n",
+                  storedSSID.c_str());
+    attempts = 1;
+  }
+
   unsigned long start = millis();
   bool ok = false;
   for (int attempt = 1;
-       attempt <= WIFI_BOOT_ATTEMPTS && millis() - start < WIFI_BOOT_TIMEOUT_MS;
+       attempt <= attempts && millis() - start < WIFI_BOOT_TIMEOUT_MS;
        attempt++) {
     unsigned long attemptStart = millis();
     WiFi.beginNoBlock(storedSSID.c_str(), storedPassword.c_str());
@@ -745,8 +774,19 @@ void netLoop() {
         setNetState(NET_OFFLINE); // re-arme, essai dans 10 min
         break;
       }
-      scanNetworksForApp(); // liste fraiche pour la prochaine visite de l'app
+      // Liste fraiche pour la prochaine visite de l'app
+      ScanResult seen = scanNetworksForApp();
       if (storedSSID.length() == 0) {
+        setNetState(NET_OFFLINE);
+        break;
+      }
+      // Reseau absent : pas d'essai de 30 s pour rien (la radio est partagee
+      // avec le Bluetooth de l'app). Un reseau masque n'est retente qu'au
+      // prochain demarrage.
+      if (seen == SCAN_ABSENT) {
+        Serial.printf("[WiFi] %s toujours introuvable, prochain essai dans "
+                      "10 min\n",
+                      storedSSID.c_str());
         setNetState(NET_OFFLINE);
         break;
       }
