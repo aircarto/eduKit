@@ -12,4 +12,4 @@
  *
  * 20 caracteres au plus (colonne capteurs.firmware_version).
  */
-#define FIRMWARE_VERSION "2.1.0"
+#define FIRMWARE_VERSION "2.1.1"
