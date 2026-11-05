@@ -1,0 +1,13 @@
+{
+  "name": "edukit-tuto-rendus",
+  "private": true,
+  "description": "Rendus 3D des etapes du tutoriel de montage EduKit CO2",
+  "type": "module",
+  "scripts": {
+    "render": "node render.mjs",
+    "viewer": "node render.mjs --serve"
+  },
+  "devDependencies": {
+    "playwright-core": "1.65.0-alpha-2026-10-30"
+  }
+}

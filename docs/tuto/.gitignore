@@ -1,0 +1,3 @@
+node_modules/
+# images generees par npm run render (non versionnees)
+img/

@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EduKit CO2 - montage en 3D</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #e9edf1; font-family: "DejaVu Sans", system-ui, sans-serif; }
+  html.transparent, body.transparent { background: transparent; }
+  canvas { display: block; }
+  #ui { position: fixed; top: 8px; left: 8px; z-index: 1; display: flex; flex-wrap: wrap; gap: 4px; max-width: calc(100% - 16px); }
+  #ui button { border: 1px solid #aaa; background: #fff; border-radius: 4px; padding: 4px 8px; cursor: pointer; font-size: 12px; }
+  #ui button.on { background: #0077b6; color: #fff; border-color: #0077b6; }
+  body.render #ui, body.render #aide { display: none; }
+  #aide { position: fixed; bottom: 8px; left: 8px; right: 8px; font-size: 12px; color: #555; }
+  canvas.survol { cursor: pointer; }
+  /* panneau d'explication d'un cable */
+  #fiche { position: fixed; top: 52px; right: 12px; width: 300px; max-width: calc(100% - 24px); background: #fff;
+    border-radius: 10px; box-shadow: 0 6px 24px rgba(0,0,0,.18); padding: 14px 16px 16px; font-size: 14px; color: #222;
+    transform: translateX(calc(100% + 24px)); transition: transform .2s ease; z-index: 2; }
+  #fiche.ouvert { transform: none; }
+  #fiche .fermer { position: absolute; top: 6px; right: 10px; border: 0; background: none; font-size: 22px; line-height: 1; cursor: pointer; color: #666; }
+  #fiche .entete { display: flex; align-items: center; gap: 10px; margin: 0 24px 12px 0; font-weight: 700; font-size: 15px; }
+  #fiche .pastille { width: 34px; height: 10px; border-radius: 5px; border: 1px solid rgba(0,0,0,.25); flex-shrink: 0; }
+  #fiche .bout { border: 1px solid #e3e6ea; border-radius: 8px; padding: 8px 10px; }
+  #fiche .bout .carte { font-size: 12px; color: #666; }
+  #fiche .bout .broche { font-size: 18px; font-weight: 700; font-family: "DejaVu Sans Mono", ui-monospace, monospace; }
+  #fiche .bout .ou { font-size: 12.5px; color: #444; margin-top: 2px; }
+  #fiche .fleche { text-align: center; color: #999; font-size: 18px; line-height: 1.4; }
+  #fiche .role { margin: 12px 0 0; line-height: 1.45; }
+  @media (max-width: 600px) {
+    #fiche { top: auto; bottom: 0; right: 0; left: 0; width: auto; max-width: none; border-radius: 12px 12px 0 0;
+      transform: translateY(110%); }
+  }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="ui"></div>
+<div id="aide">Cliquer sur un câble pour savoir où le brancher. Glisser pour tourner, molette ou pincement pour zoomer. <a href="/eduKit_co2/tuto.html">Retour au tutoriel</a></div>
+<aside id="fiche" aria-live="polite" aria-hidden="true">
+  <button type="button" class="fermer" aria-label="Fermer">&times;</button>
+  <div class="entete"><span class="pastille"></span><span class="titre"></span></div>
+  <div class="bout"><div class="carte de-carte"></div><div class="broche de-broche"></div></div>
+  <div class="fleche" aria-hidden="true">&darr;</div>
+  <div class="bout"><div class="carte vers-carte"></div><div class="broche vers-broche"></div><div class="ou vers-ou"></div></div>
+  <p class="role"></p>
+</aside>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { STEPS, WIRE_COLORS, buildStep, buildPart, dupontSample, loadPlate, loadScreen, describeWire, setLang } from './edukit3d.js';
+
+// ?step=07_fils_ecran  |  ?part=pico  |  &render=1 (capture, sans interface)
+// &view=top (vue de dessus)  &zoom=support (cadre sur une piece)
+const q = new URLSearchParams(location.search);
+const render = q.has('render');
+const W = +(q.get('w') || 1600), H = +(q.get('h') || 1200);
+if (render) document.body.classList.add('render');
+if (q.has('part')) { document.body.classList.add('transparent'); document.documentElement.classList.add('transparent'); }
+
+// Langue : ?lang=en|fr, sinon celle retenue par le site (aircarto_lang), sinon
+// celle du navigateur. Les captures restent en francais sauf ?lang=en.
+function savedLang() { try { return localStorage.getItem('aircarto_lang'); } catch { return null; } }
+const asked = q.get('lang'), saved = savedLang();
+const lang = asked === 'en' || asked === 'fr' ? asked
+  : render ? 'fr'
+  : saved === 'en' || saved === 'fr' ? saved
+  : (navigator.language || 'fr').startsWith('fr') ? 'fr' : 'en';
+const EN = lang === 'en';
+setLang(lang);
+document.documentElement.lang = lang;
+const TXT = EN ? {
+  title: 'EduKit CO2 - 3D wiring',
+  aide: 'Click a wire to see where it goes. Drag to rotate, scroll or pinch to zoom.',
+  retour: 'Back to the tutorial', tuto: '/eduKit_co2/tuto-en.html', fermer: 'Close',
+  cable: (c) => `${c[0].toUpperCase()}${c.slice(1)} wire`, autre: 'FR', autreLabel: 'Version française',
+} : {
+  title: 'EduKit CO2 - montage en 3D',
+  aide: 'Cliquer sur un câble pour savoir où le brancher. Glisser pour tourner, molette ou pincement pour zoomer.',
+  retour: 'Retour au tutoriel', tuto: '/eduKit_co2/tuto.html', fermer: 'Fermer',
+  cable: (c) => `Câble ${c}`, autre: 'EN', autreLabel: 'English version',
+};
+document.title = TXT.title;
+{
+  const aide = document.getElementById('aide');
+  aide.textContent = TXT.aide + ' ';
+  const a = document.createElement('a'); a.href = TXT.tuto; a.textContent = TXT.retour; aide.appendChild(a);
+  document.querySelector('#fiche .fermer').setAttribute('aria-label', TXT.fermer);
+}
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(render ? 1 : devicePixelRatio);
+renderer.setSize(render ? W : innerWidth, render ? H : innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.add(new THREE.HemisphereLight('#ffffff', '#b8b1a3', 1.6));
+const sun = new THREE.DirectionalLight('#ffffff', 2.4);
+sun.position.set(-70, 220, 40);
+sun.target.position.set(57, 0, 80);
+sun.castShadow = true;
+sun.shadow.mapSize.set(4096, 4096);
+Object.assign(sun.shadow.camera, { left: -150, right: 150, top: 150, bottom: -150, near: 10, far: 500 });
+sun.shadow.bias = -0.0004;
+sun.shadow.normalBias = 0.3;
+scene.add(sun, sun.target);
+const fill = new THREE.DirectionalLight('#dfe8ff', 0.6);
+fill.position.set(200, 120, 250);
+scene.add(fill);
+
+const camera = new THREE.PerspectiveCamera(28, (render ? W / H : innerWidth / innerHeight), 1, 3000);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = !render;
+
+let current = null;
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(2000, 2000), new THREE.ShadowMaterial({ opacity: 0.18 }));
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = -3.05;
+ground.receiveShadow = true;
+
+// Cadre la camera sur une boite, vue depuis l'eleve (bas de la plaque), en 3/4.
+// Vue de dessus : camera orthographique (pas de parallaxe sur les broches).
+const ortho = new THREE.OrthographicCamera(-1, 1, 1, -1, 1, 3000);
+let cam = camera;
+function frame(box, { view = 'iso', margin = 0.04 } = {}) {
+  const aspect = render ? W / H : innerWidth / innerHeight;
+  const corners = [];
+  for (const x of [box.min.x, box.max.x]) for (const y of [box.min.y, box.max.y]) for (const z of [box.min.z, box.max.z]) corners.push(new THREE.Vector3(x, y, z));
+  const c = box.getCenter(new THREE.Vector3());
+  if (view === 'top') {
+    cam = ortho;
+    let w = box.max.x - box.min.x, h = box.max.z - box.min.z;
+    w *= 1 + 2 * margin; h *= 1 + 2 * margin;
+    if (w / h > aspect) h = w / aspect; else w = h * aspect;
+    Object.assign(ortho, { left: -w / 2, right: w / 2, top: h / 2, bottom: -h / 2 });
+    ortho.position.set(c.x, 600, c.z);
+    ortho.up.set(0, 0, -1);
+    ortho.lookAt(c.x, 0, c.z);
+    ortho.updateProjectionMatrix();
+    controls.object = ortho;
+    controls.target.set(c.x, 0, c.z);
+    controls.update();
+    return;
+  }
+  cam = camera;
+  controls.object = camera;
+  camera.aspect = aspect;
+  const dir = (view === 'front' ? new THREE.Vector3(0, 0.9, 1.0) : new THREE.Vector3(0.38, 1.05, 0.95)).normalize();
+  let target = c.clone(), dist = box.getBoundingSphere(new THREE.Sphere()).radius * 3;
+  // quelques passes : on recentre et on rapproche jusqu'a remplir l'image
+  for (let i = 0; i < 8; i++) {
+    camera.position.copy(target).add(dir.clone().multiplyScalar(dist));
+    camera.up.set(0, 1, 0);
+    camera.lookAt(target);
+    camera.near = dist / 20; camera.far = dist * 6;
+    camera.updateProjectionMatrix();
+    camera.updateMatrixWorld();
+    let x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9;
+    for (const p of corners) {
+      const n = p.clone().project(camera);
+      x0 = Math.min(x0, n.x); x1 = Math.max(x1, n.x); y0 = Math.min(y0, n.y); y1 = Math.max(y1, n.y);
+    }
+    const mid = new THREE.Vector3((x0 + x1) / 2, (y0 + y1) / 2, new THREE.Vector3().copy(target).project(camera).z).unproject(camera);
+    target.add(mid.sub(target));
+    const ext = Math.max((x1 - x0) / 2, (y1 - y0) / 2) * (1 + margin);
+    dist *= ext;
+  }
+  controls.target.copy(target);
+  controls.update();
+}
+
+async function show(key) {
+  select(null);
+  if (current) scene.remove(current);
+  let box;
+  if (q.has('part')) {
+    const name = q.get('part');
+    current = name === 'dupont' ? dupontSample() : name === 'plaque' ? plate.clone() : buildPart(name);
+    scene.add(current);
+    box = new THREE.Box3().setFromObject(current);
+    frame(box, { view: q.get('view') || 'iso', margin: 0.04 });
+  } else {
+    const { root, parts, focus } = buildStep(plate, key, { tags: q.get('view') === 'top' && (q.has('zoom') || q.has('zone')) });
+    current = root;
+    scene.add(current);
+    if (!scene.children.includes(ground)) scene.add(ground);
+    const zoom = q.get('zoom');
+    // &zone=x0,y0,x1,y1 : cadre sur une zone de la plaque (mm)
+    const zone = q.get('zone')?.split(',').map(Number);
+    box = zone ? new THREE.Box3(new THREE.Vector3(zone[0], 0, zone[1]), new THREE.Vector3(zone[2], 30, zone[3]))
+      : zoom ? new THREE.Box3().setFromObject(parts[zoom]) : new THREE.Box3().setFromObject(root);
+    frame(box, { view: q.get('view') || 'iso', margin: zone ? 0 : zoom ? 0.16 : 0.05 });
+  }
+  document.querySelectorAll('#ui button').forEach((b) => b.classList.toggle('on', b.dataset.key === key));
+}
+
+// chemins par defaut : ceux du depot, ou ceux poses sur <body> par publier.sh
+const plate = await loadPlate(q.get('stl') || document.body.dataset.stl || '../../plaque/plaque_edukit.stl');
+await loadScreen(q.get('screen') || (EN ? document.body.dataset.screenEn || '../../ecran_edukit_en.png'
+  : document.body.dataset.screen || '../../ecran_edukit_fr.png'));
+
+const ui = document.getElementById('ui');
+for (const key of Object.keys(STEPS)) {
+  const b = document.createElement('button');
+  b.textContent = (EN ? STEPS[key].title : STEPS[key].titre) || key;
+  b.dataset.key = key;
+  b.onclick = () => show(key);
+  ui.appendChild(b);
+}
+{
+  // bascule de langue : retenue pour tout le site, comme le selecteur d'aircarto.fr
+  const b = document.createElement('button');
+  b.textContent = TXT.autre; b.title = TXT.autreLabel; b.setAttribute('aria-label', TXT.autreLabel);
+  b.style.marginLeft = 'auto';
+  b.onclick = () => {
+    const next = EN ? 'fr' : 'en';
+    try { localStorage.setItem('aircarto_lang', next); } catch { /* navigation privee */ }
+    const u = new URL(location.href); u.searchParams.set('lang', next); location.href = u.toString();
+  };
+  ui.appendChild(b);
+}
+
+// ---------------------------------------------------------------- clic sur un cable
+
+const fiche = document.getElementById('fiche');
+const $ = (c) => fiche.querySelector(c);
+let selected = null;
+let endLabels = [];
+
+function wireOf(obj) {
+  for (let o = obj; o; o = o.parent) if (o.userData.wire) return o;
+  return null;
+}
+function wires() {
+  const out = [];
+  current?.traverse((o) => { if (o.userData.wire) out.push(o); });
+  return out;
+}
+
+// Etiquette toujours face a la camera, au-dessus d'un bout du cable.
+function label(textStr, color, at) {
+  const c = document.createElement('canvas');
+  const ctx = c.getContext('2d');
+  const font = 'bold 44px "DejaVu Sans", sans-serif';
+  ctx.font = font;
+  c.width = Math.ceil(ctx.measureText(textStr).width) + 40; c.height = 72;
+  ctx.font = font;
+  ctx.fillStyle = '#fff'; ctx.strokeStyle = color === WIRE_COLORS.blanc ? '#555' : color; ctx.lineWidth = 8;
+  ctx.beginPath(); ctx.roundRect(4, 4, c.width - 8, c.height - 8, 18); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = '#111'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(textStr, c.width / 2, c.height / 2 + 2);
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: t, depthTest: false }));
+  sp.renderOrder = 20;
+  const h = 4.2;
+  sp.scale.set(h * c.width / c.height, h, 1);
+  sp.position.copy(at).add(new THREE.Vector3(0, 5, 0));
+  return sp;
+}
+
+function select(g) {
+  for (const l of endLabels) l.parent?.remove(l);
+  endLabels = [];
+  selected = g;
+  for (const w of wires()) {
+    const { materials, color, faded } = w.userData.wire;
+    const base = new THREE.Color(WIRE_COLORS[color]);
+    if (faded && !(g === w)) base.lerp(new THREE.Color('#b9b6ae'), 0.65);
+    materials.wire.color.copy(base);
+    const dim = g && g !== w;
+    for (const m of [materials.wire, materials.housing, materials.outline].filter(Boolean)) {
+      m.transparent = dim; m.opacity = dim ? 0.15 : 1; m.depthWrite = !dim;
+      m.emissive?.set(0x000000); m.needsUpdate = true;
+    }
+    if (materials.outline) materials.outline.color.set(materials.outlineColors[faded && g !== w ? 1 : 0]);
+    if (g === w) materials.housing.color.set('#1b1b1e');
+    else materials.housing.color.set(faded ? '#55555a' : '#1b1b1e');
+  }
+  if (!g) {
+    fiche.classList.remove('ouvert'); fiche.setAttribute('aria-hidden', 'true');
+    return;
+  }
+  const info = describeWire(g.userData.wire);
+  const [ea, eb] = g.userData.wire.ends;
+  endLabels = [label(info.de.broche, info.hex, ea), label(info.vers.broche, info.hex, eb)];
+  for (const l of endLabels) current.add(l);
+  $('.pastille').style.background = info.hex;
+  $('.titre').textContent = TXT.cable(info.couleur);
+  $('.de-carte').textContent = info.de.carte;
+  $('.de-broche').textContent = info.de.broche;
+  $('.vers-carte').textContent = info.vers.carte;
+  $('.vers-broche').textContent = info.vers.broche;
+  $('.vers-ou').textContent = info.vers.ou;
+  $('.role').textContent = info.role;
+  fiche.classList.add('ouvert'); fiche.setAttribute('aria-hidden', 'false');
+}
+
+$('.fermer').addEventListener('click', () => select(null));
+addEventListener('keydown', (e) => { if (e.key === 'Escape') select(null); });
+
+const ray = new THREE.Raycaster();
+function pick(ev) {
+  const r = renderer.domElement.getBoundingClientRect();
+  const ndc = new THREE.Vector2(((ev.clientX - r.left) / r.width) * 2 - 1, -((ev.clientY - r.top) / r.height) * 2 + 1);
+  ray.setFromCamera(ndc, cam);
+  for (const hit of ray.intersectObjects(current ? [current] : [], true)) {
+    const w = wireOf(hit.object);
+    if (w) return w;
+    if (hit.object.material?.colorWrite !== false && !hit.object.isSprite) return null;  // une carte cache le fil
+  }
+  return null;
+}
+if (!render) {
+  // un clic, pas un glisser pour tourner la vue
+  let down = null;
+  renderer.domElement.addEventListener('pointerdown', (e) => { down = [e.clientX, e.clientY]; });
+  renderer.domElement.addEventListener('pointerup', (e) => {
+    if (!down || Math.hypot(e.clientX - down[0], e.clientY - down[1]) > 6) return;
+    const w = pick(e);
+    select(w && w === selected ? null : w);
+  });
+  renderer.domElement.addEventListener('pointermove', (e) => {
+    if (e.buttons) return;
+    renderer.domElement.classList.toggle('survol', !!pick(e));
+  });
+}
+
+// la visionneuse s'ouvre sur le montage cable ; les captures suivent ?step=
+await show(q.get('step') || (render ? Object.keys(STEPS)[0] : '04_allume'));
+addEventListener('resize', () => {
+  if (render) return;
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+function loop(t = 0) {
+  controls.update();
+  // le cable choisi pulse doucement
+  if (selected) {
+    const { materials, color } = selected.userData.wire;
+    const k = 0.25 + 0.2 * Math.sin(t / 220);
+    materials.wire.emissive.set(WIRE_COLORS[color]).multiplyScalar(k);
+    materials.housing.emissive.set(WIRE_COLORS[color]).multiplyScalar(k * 0.8);
+  }
+  renderer.render(scene, cam);
+  if (!render) requestAnimationFrame(loop);
+}
+loop();
+renderer.render(scene, cam);
+window.__ready = true;
+</script>
+</body>
+</html>

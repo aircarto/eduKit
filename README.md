@@ -26,13 +26,19 @@ les mesures au serveur AirCarto pour les consulter dans l'app.
 | SensAir | Pico 2 W | Broche physique |
 |---------|----------|-----------------|
 | G0       | GND | 38 |
-| G+       | VBUS (5V) | 40 |
+| G+       | Rail 5V de la carte support (VSYS) | 39 |
 | UART_TxD | GPIO 1 (UART0 RX) | 2 |
 | UART_RxD | GPIO 0 (UART0 TX) | 1 |
 
-> ⚠️ Le SensAir S88 s'alimente en **5V**. `VBUS` n'a du 5V que lorsque le Pico
-> est branché en USB : sur batterie, il faut alimenter `G+` par la sortie 5V
-> de l'alimentation. Ses lignes UART sont en 3.3V, compatibles avec le Pico.
+> ⚠️ Le SensAir S88 s'alimente en **5V**, sur le rail 5V de la carte support,
+> relié à `VSYS` (broche 39, notée « 5V » sur la carte). La carte batterie
+> amène son 5V (connecteur H1) sur ce même rail : le Pico et le S88 sont
+> alimentés sur batterie comme en USB. Ne pas utiliser `VBUS` (broche 40), qui
+> n'a du 5V que lorsque le Pico est branché en USB. Les lignes UART du S88 sont
+> en 3.3V, compatibles avec le Pico.
+>
+> Tutoriel de montage illustré : [aircarto.fr/eduKit_co2/tuto.html](https://aircarto.fr/eduKit_co2/tuto.html)
+> (images et scène 3D dans [`docs/tuto/`](docs/tuto/)).
 
 #### Capteur BME280 (optionnel, I2C1, adresse 0x76 ou 0x77)
 Température, humidité et pression, sur un bus I2C séparé de l'écran : un
